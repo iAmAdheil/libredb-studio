@@ -1829,13 +1829,6 @@ function objectDetailFromRows(
 ): ObjectDetail {
   const columns: ColumnSchema[] = rows.columns.map((row) => ({
     name: row.column_name,
-    // `COLUMN_TYPE` and not `DATA_TYPE` (#1033). `DATA_TYPE` is the FAMILY: it is `varchar`
-    // for a `VARCHAR(20)`, `decimal` for a `DECIMAL(12,2)`, `enum` for an `ENUM` whatever its
-    // values, and `int` for an `INT UNSIGNED`. `varchar` with no length is not a type on
-    // either server, so every migration the schema-diff generator wrote from that reading was
-    // refused. The family is still what a reader DECIDES on, and it rides beside as
-    // `baseType` - see `ColumnSchema` - omitted where the two agree, because an absent field
-    // there says the engine draws no distinction rather than that nobody looked.
     type: row.column_type,
     ...(row.column_type === row.data_type ? {} : { baseType: row.data_type }),
     nullable: row.is_nullable === "YES",
