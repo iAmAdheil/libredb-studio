@@ -20,7 +20,7 @@
 
 > 📖 **Full documentation, source, and issues:** <https://github.com/libredb/libredb-studio>
 
-Query **PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra** from your browser — with AI-powered query assistance, interactive ER diagrams, schema diff, a virtualized data grid, RBAC, OIDC SSO, and a live monitoring dashboard. A lightweight, secure bridge between heavy desktop tools (DataGrip/DBeaver) and minimal CLIs.
+Query **PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra, Prometheus and Apache Kafka** from your browser, with AI-powered query assistance, interactive ER diagrams, schema diff, a virtualized data grid, RBAC, OIDC SSO, and a live monitoring dashboard. A lightweight, secure bridge between heavy desktop tools (DataGrip/DBeaver) and minimal CLIs.
 
 ---
 
@@ -88,11 +88,11 @@ The network route is the one to prefer for a real deployment: put Studio and its
 | Tag | Pushed from | Use |
 |-----|-------------|-----|
 | `latest` | `main` | Latest stable build |
-| `X.Y.Z` | `main` / release | Pin an exact version, e.g. `docker pull libredb/libredb-studio:0.16.1` (recommended for production) |
+| `X.Y.Z` | `main` / release | Pin an exact version, e.g. `docker pull libredb/libredb-studio:0.16.2` (recommended for production) |
 | `dev` | `feat/**`, `fix/**` branches | Bleeding-edge / preview (`linux/amd64` only) |
 | `sha-<commit>` | every build | Exact immutable commit |
 
-Every one of those tags is published on three bases, and the suffix is appended to the tag it would otherwise be (`0.16.1`, `0.16.1-alpine`, `0.16.1-alpine-slim`; likewise `latest-alpine`, `dev-alpine`):
+Every one of those tags is published on three bases, and the suffix is appended to the tag it would otherwise be (`0.16.2`, `0.16.2-alpine`, `0.16.2-alpine-slim`; likewise `latest-alpine`, `dev-alpine`):
 
 | Suffix | Base | Engines | Use |
 |-----|-------------|-----|-----|
@@ -109,7 +109,8 @@ Every one of those tags is published on three bases, and the suffix is appended 
 
 ## Supported databases
 
-Sixteen external engines share one interface, and three of them are read-only because their own SQL is. The table below has seventeen rows: the seventeenth is the embedded LibreDB store, which ships inside the image rather than being a server you connect out to.
+Eighteen external engines share one interface.
+The nineteenth row is the embedded LibreDB store, which ships inside the image rather than being a server you connect out to.
 
 | Database | Driver | Highlights |
 | :--- | :--- | :--- |
@@ -129,17 +130,20 @@ Sixteen external engines share one interface, and three of them are read-only be
 | **OpenSearch** | none — HTTP | The same read-only IDE over `_plugins/_sql`, from the same provider module; `LIMIT … OFFSET` paging works here |
 | **Apache Trino** | none — HTTP | Full SQL IDE over the client protocol, every configured catalog in one tree, `EXPLAIN (FORMAT JSON)` plans, `system.runtime` monitoring and query cancellation |
 | **Apache Cassandra** | `cassandra-driver` (pure JS) | CQL editor over the native protocol, keyspace browser with partition and clustering keys marked, `system_views` monitoring. No row counts and no sizes: the only figures Cassandra publishes are partition estimates and whole mebibytes, so neither is shown rather than shown wrong |
+| **Prometheus** | none, HTTP | PromQL editor, metric, rule and target browser |
+| **Apache Kafka** | `@platformatic/kafka` | Topic, group and broker browser, reads by offset or time |
 | **LibreDB** | `@libredb/libredb` | The embedded key-value store, for a database with nothing to install |
 
-**Read-only where the engine is.** Druid, Elasticsearch and OpenSearch have no `UPDATE` and no `CREATE TABLE` anywhere in their grammar, so inline editing and DDL are reported as unsupported instead of failing when used. Everything else works wherever the engine has something to answer with.
+**Read-only where the engine is.** Druid, Elasticsearch and OpenSearch have no `UPDATE` and no `CREATE TABLE` anywhere in their grammar, so inline editing and DDL are reported as unsupported instead of failing when used.
+Prometheus and Apache Kafka are read-only too: Studio calls only their read APIs.
 
 ### Engines with no provider of their own
 
-Twenty-six further engines speak the wire protocol of one of the sixteen drivers above, so they connect through it unchanged: pick that driver in the connection dialog. The table has twenty-two rows rather than twenty-six because engines that behave identically share a row; all twenty-six are named in it. Every one of them was measured against a real instance rather than assumed, and how much of the product worked is recorded per engine.
+Twenty-eight further engines speak the wire protocol of one of the eighteen drivers above, so they connect through it unchanged: pick that driver in the connection dialog. Engines that behave identically share a row, and all twenty-eight are named in it. Every one of them was measured against a real instance rather than assumed, and how much of the product worked is recorded per engine.
 
 | Engine | Connect as | Support |
 | :--- | :--- | :--- |
-| MariaDB · Percona Server for MySQL | `mysql` | Full — both are drop-in builds and both were measured rather than assumed: all fifteen surfaces answer and the numbers are correct. Nothing on screen says Percona, though: `version()` answers a bare 8.4.11-11 and the product name is only in `@@version_comment` |
+| MariaDB · Percona Server for MySQL | `mysql` | Full - both are drop-in builds: all fifteen surfaces answer and the numbers are correct. Nothing on screen says Percona, though: `version()` answers a bare 8.4.11-11 and the product name is only in `@@version_comment` |
 | Percona Distribution for PostgreSQL | `postgres` | Full — behaves as PostgreSQL throughout, with correct row counts and sizes, and unlike the MySQL build it names itself in `version()` |
 | ParadeDB | `postgres` | Full — correct numbers, but its nine extensions put 41 objects in the object browser for 2 user tables, and agent plan mode fails on a stock install because 539 non-system columns exceed the grounding capture's ceiling. `version()` names PostgreSQL only |
 | OrioleDB | `postgres` | Full — clean object browser and exact row counts, but its own storage is invisible to PostgreSQL's size functions, so every index reads 0 bytes and the cache hit ratio reads N/A. Nightly images only |
@@ -159,7 +163,9 @@ Twenty-six further engines speak the wire protocol of one of the sixteen drivers
 | OceanBase | `mysql` | Partial - health fails outright because the tenant has no `performance_schema` database at all, every size reads 0 B, and row counts are correct only once `ANALYZE TABLE` has run |
 | SingleStore | `mysql` | Partial - every surface answers, including the five that once failed for reasons that were ours rather than SingleStore's. Row counts and sizes are missing rather than wrong, a 2000-row table reading 0 rows and 0 B, and foreign keys do not exist at all |
 | ScyllaDB | `cassandra` | Partial - the editor and the object browser work in full, and all 18 CQL types read back byte-identically to the Apache Cassandra 5.0.9 probed in the same pass. ScyllaDB has no `system_views` keyspace at all, so the overview, health, metrics, session and monitoring panels read empty rather than throw. No version is displayed, and creating a keyspace on the 2026.2 line needs `NetworkTopologyStrategy` |
-| Materialize · RisingWave | `postgres` | Query editor only |
+| VictoriaMetrics | `prometheus` | Partial |
+| Redpanda | `kafka` | Full |
+| Materialize · RisingWave | `postgres` | Partial |
 | Databend | `mysql` | Query editor only — SQL and a plain `EXPLAIN` run, but every parameterised read fails with *Prepare is not support in Databend*, so the object browser and all statistics panels are empty |
 
 Details, probed versions and each caveat: [`docs/providers/README.md`](https://github.com/libredb/libredb-studio/blob/main/docs/providers/README.md).
@@ -211,7 +217,6 @@ Health check endpoint: `GET /api/db/health` · Container HTTP port: `3000`.
 
 ## Deploy
 
-- **Docker / Compose** — see Quick start above.
 - **Kubernetes (Helm)** — `oci://ghcr.io/libredb/charts/libredb-studio` · [Artifact Hub](https://artifacthub.io/packages/search?repo=libredb-studio)
 - **CapRover** — built into the official One-Click Apps catalog: **Apps → One-Click Apps/Databases** → search **LibreDB Studio**. No third-party repo to add.
 - **PaaS** — one-click buttons for Koyeb & Render in the [GitHub README](https://github.com/libredb/libredb-studio#one-click-deploy).
@@ -234,7 +239,5 @@ Health check endpoint: `GET /api/db/health` · Container HTTP port: `3000`.
 LibreDB Studio is open source under the MIT license and free to use, with no paid tier gating any feature on this page. If it is useful to you, a star on GitHub is the clearest signal that the work is worth continuing.
 
 <a href="https://github.com/libredb/libredb-studio"><img src="https://img.shields.io/github/stars/libredb/libredb-studio?style=social" alt="GitHub stars"></a>
-
-Repository: <https://github.com/libredb/libredb-studio>
 
 <sub>This page mirrors <a href="https://github.com/libredb/libredb-studio/blob/main/DOCKERHUB.md">DOCKERHUB.md</a> in the GitHub repository.</sub>

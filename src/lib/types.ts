@@ -82,7 +82,19 @@ export type DatabaseType =
   // MotherDuck (`md:`), Quack and DuckLake are NOT this id and have no row anywhere
   // yet: each is a different connection story than a local path, and #424 publishes
   // no name it has not connected to.
-  | "duckdb";
+  | "duckdb"
+  // Prometheus (#1085). A metrics store queried in PromQL over its HTTP API, and the first
+  // provider whose `queryLanguage` is neither `sql` nor `json`. The connection is a host, a port
+  // and an optional credential: `user` and `password` are HTTP Basic, and a password with no
+  // user is sent as a bearer token. VictoriaMetrics speaks the same API and is recorded as a
+  // relative of this id, never as an id of its own.
+  | "prometheus"
+  // Apache Kafka (#1088). A message log browsed read-only over the Kafka protocol, the first
+  // member of the `stream/` family. Its editor text is a JSON read request, so it declares
+  // `queryLanguage: "json"` with a `queryDialect` of its own. The connection is one bootstrap
+  // address plus TLS and an optional SASL credential, `saslMechanism` below naming how `user` and
+  // `password` are checked; the client learns every other broker from the cluster's metadata.
+  | "kafka";
 
 export type ConnectionEnvironment = "production" | "staging" | "development" | "local" | "other";
 
@@ -260,6 +272,16 @@ export interface DatabaseConnection {
    */
   authSource?: string;
   /**
+   * Kafka: the SASL mechanism that checks `user` and `password`, absent meaning none (#1088).
+   *
+   * A mechanism NAME, never a credential, and not a refinement either: a broker keeps a SCRAM
+   * credential per mechanism, so the same user and password are a different principal's secret
+   * under each, and a credential sent with no mechanism has no way to be sent at all, which the
+   * provider refuses rather than dropping. PLAIN and both SCRAM mechanisms require TLS there.
+   * OAUTHBEARER and GSSAPI are not offered.
+   */
+  saslMechanism?: "PLAIN" | "SCRAM-SHA-256" | "SCRAM-SHA-512";
+  /**
    * Read no catalog when this connection opens.
    *
    * For a connection whose owner holds tens of thousands of objects, even the two cheap
@@ -328,10 +350,11 @@ export interface ColumnSchema {
    * across the fleet.
    *
    * On most providers it is the engine's own catalog TEXT, copied out unchanged: PostgreSQL
-   * reports `nextval('app.orders_id_seq'::regclass)` here, SQL Server `((0))`, DuckDB and
-   * libSQL and SQLite the quoted literal. On MySQL and MariaDB it is the DECODED value,
-   * `abc` rather than `'abc'`, because MariaDB reports the default as the expression its
-   * author wrote and showing that to a reader showed a default nobody wrote (#795).
+   * reports `nextval('app.orders_id_seq'::regclass)` here, SQL Server `((0))`. On MySQL and
+   * MariaDB it is the DECODED value, `abc` rather than `'abc'`, because MariaDB reports the
+   * default as the expression its author wrote and showing that to a reader showed a default
+   * nobody wrote (#795). SQLite, libSQL and DuckDB report it the same way MariaDB does and
+   * decode it the same way (#1029).
    *
    * ClickHouse is neither. `readDefault` in `clickhouse/introspect.ts` answers the bare
    * expression for kind `DEFAULT` and CONSTRUCTS `MATERIALIZED a + b` for the other kinds,
@@ -540,7 +563,7 @@ export interface QueryTab {
    */
   resultQuery?: string;
   isExecuting: boolean;
-  type: "sql" | "mongodb" | "redis" | "libredb";
+  type: "sql" | "mongodb" | "redis" | "libredb" | "promql" | "kafka";
   viewMode?: "results" | "explain" | "history" | "saved";
   explainPlan?: unknown;
   // Pagination state
@@ -548,9 +571,27 @@ export interface QueryTab {
   isLoadingMore?: boolean;
   allRows?: Record<string, unknown>[];
   /**
+   * The numbered database this tab's statements belong to, when the tab was opened against one
+   * that is NOT the connection's own session database.
+   *
+   * WHY THE TAB CARRIES IT. A key lives in exactly one numbered database, and Redis has no
+   * database-qualified key syntax: the database is a property of the CONNECTION (`SELECT n`) and
+   * never of the statement. `GET report:daily` therefore names the key and cannot name the database
+   * it is in, so the same statement sent on a connection sitting in another database reads a
+   * different key space and answers `(nil)` for a key that is right there. The panel that opened
+   * this tab walked one database, and every run of the tab - the initial read, the next Run, a
+   * selection, an inline edit, the next page - is about the same key, so the one fact travels with
+   * the tab rather than with the call that opened it.
+   *
+   * ABSENT MEANS NO OVERRIDE, and is not database `0` or "the session's number": it is the ordinary
+   * tab saying nothing, whose run reaches whatever database its connection names. Only this number
+   * is overridden; the connection is otherwise the active one, whole.
+   */
+  databaseOverride?: number;
+  /**
    * Present exactly on a Source tab (#789 Phase 2).
    *
-   * An optional FIELD and deliberately not a fifth member of `type`. Every member of that
+   * An optional FIELD and deliberately not another member of `type`. Every member of that
    * union is a QUERY DIALECT that `resolveTabType` may answer and that
    * `editorLanguageForTabType` maps onto `QueryEditor`'s closed language union, so a
    * `"source"` member would be an arm the resolver can never produce and the language mapper

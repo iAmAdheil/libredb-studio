@@ -17,7 +17,11 @@ import type { ProviderCapabilities } from "@/lib/db/types";
 function capsOf(overrides: Partial<ProviderCapabilities>): ProviderCapabilities {
   return { queryLanguage: "sql", ...overrides } as unknown as ProviderCapabilities;
 }
-const jsonCaps = capsOf({ queryLanguage: "json" });
+// MongoDB's declaration: one container level, the database (`MONGODB_CONTAINER_LEVELS`).
+const jsonCaps = capsOf({
+  queryLanguage: "json",
+  containerLevels: [{ id: "schema", label: "Database", labelPlural: "Databases" }],
+});
 const postgresCaps = capsOf({ defaultPort: 5432 });
 const mssqlCaps = capsOf({ defaultPort: 1433 });
 
@@ -239,11 +243,11 @@ describe("TestDataGenerator", () => {
       <TestDataGenerator
         isOpen
         onClose={mock(() => {})}
-        tablePath={["users"]}
+        tablePath={["shop", "users"]}
         tableSchema={{
           name: "users",
           kind: "table",
-          path: ["users"],
+          path: ["shop", "users"],
           indexes: [],
           columns: [{ name: "email", type: "VARCHAR(255)", nullable: false, isPrimary: false }],
         }}
@@ -307,11 +311,11 @@ describe("TestDataGenerator", () => {
       <TestDataGenerator
         isOpen
         onClose={mock(() => {})}
-        tablePath={["users"]}
+        tablePath={["shop", "users"]}
         tableSchema={{
           name: "users",
           kind: "table",
-          path: ["users"],
+          path: ["shop", "users"],
           indexes: [],
           columns: [
             { name: "name", type: "VARCHAR(100)", nullable: false, isPrimary: false },
@@ -323,6 +327,9 @@ describe("TestDataGenerator", () => {
       />,
     );
     const text = container.textContent || "";
+    // The database rides as its own key (#843): without it the insert landed in the
+    // connected database's same-named collection, a write to the wrong place.
+    expect(text).toContain('"database": "shop"');
     expect(text).toContain('"collection": "users"');
     expect(text).toContain('"operation": "insertMany"');
     expect(text).toContain('"documents"');
@@ -607,7 +614,7 @@ describe("TestDataGenerator", () => {
     const richSchema: DetailedObject = {
       name: "profiles",
       kind: "table",
-      path: ["profiles"],
+      path: ["shop", "profiles"],
       indexes: [],
       columns: [
         { name: "shipping_address", type: "VARCHAR(255)", nullable: true, isPrimary: false },
@@ -629,7 +636,7 @@ describe("TestDataGenerator", () => {
       <TestDataGenerator
         isOpen
         onClose={mock(() => {})}
-        tablePath={["profiles"]}
+        tablePath={["shop", "profiles"]}
         tableSchema={richSchema}
         capabilities={jsonCaps}
         onExecuteQuery={onExecuteQuery}
@@ -694,7 +701,7 @@ describe("TestDataGenerator", () => {
     const typedSchema: DetailedObject = {
       name: "events",
       kind: "table",
-      path: ["events"],
+      path: ["shop", "events"],
       indexes: [],
       columns: [
         { name: "birth_date", type: "DATE", nullable: true, isPrimary: false },
@@ -711,7 +718,7 @@ describe("TestDataGenerator", () => {
       <TestDataGenerator
         isOpen
         onClose={mock(() => {})}
-        tablePath={["events"]}
+        tablePath={["shop", "events"]}
         tableSchema={typedSchema}
         capabilities={jsonCaps}
         onExecuteQuery={onExecuteQuery}

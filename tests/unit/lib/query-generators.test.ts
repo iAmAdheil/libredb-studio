@@ -10,6 +10,10 @@ import {
 import * as generators from "@/lib/query-generators";
 import type { ProviderCapabilities } from "@/lib/db/types";
 import type { ColumnSchema } from "@/lib/types";
+import { metricSelector } from "@/lib/db/providers/timeseries/prometheus/promql";
+import { parseReadRequest } from "@/lib/db/providers/stream/kafka/request";
+import { KAFKA_TOPIC_COLUMNS } from "@/lib/db/providers/stream/kafka/objects";
+import { DEFAULT_QUERY_LIMIT } from "@/lib/db/utils/query-limiter";
 
 // ============================================================================
 // Helpers
@@ -56,6 +60,8 @@ describe("generateTableQuery", () => {
     expect(parsed.collection).toBe("users");
     expect(parsed.operation).toBe("find");
     expect(parsed.options.limit).toBe(50);
+    // A one-segment path names no database, so no `database` key is emitted.
+    expect(parsed.database).toBeUndefined();
   });
 
   test("Oracle (port 1521) carries no row bound either", () => {
@@ -1146,23 +1152,65 @@ describe("the generated statement addresses an object by its path", () => {
   });
 });
 
+// The MongoDB declaration, as `MONGODB_CONTAINER_LEVELS` states it: one level, the database.
+const mongoCaps = makeCaps({
+  queryLanguage: "json",
+  defaultPort: null,
+  containerLevels: [{ id: "schema", label: "Database", labelPlural: "Databases" }],
+});
+
 // ============================================================================
 // The four branches that must NOT be qualified, one test each (#789, Task 30)
 // ============================================================================
 
 describe("the dialects that address one key or collection, not a qualified name", () => {
-  test("MongoDB names the COLLECTION, not the database that holds it", () => {
+  test("MongoDB names the collection and carries its database as its own key", () => {
     // A collection's path is [database, collection] (`MONGODB_CONTAINER_LEVELS`), and the
     // driver takes the collection name alone: `db.collection("sample_shop.users")` would
-    // create a collection literally called that.
-    const out = generateTableQuery(["sample_shop", "users"], makeCaps({ queryLanguage: "json", defaultPort: null }));
-    expect(JSON.parse(out).collection).toBe("users");
-    expect(out).not.toContain("sample_shop");
+    // create a collection literally called that. The database rides as the `database`
+    // key instead (#843), which is what makes the statement read the collection's own
+    // database rather than the connected one.
+    const parsed = JSON.parse(generateTableQuery(["sample_shop", "users"], mongoCaps));
+    expect(parsed.collection).toBe("users");
+    expect(parsed.database).toBe("sample_shop");
   });
 
-  test("MongoDB's Generate Query names the collection too", () => {
-    const caps = makeCaps({ queryLanguage: "json", defaultPort: null });
-    expect(JSON.parse(generateSelectQuery(["sample_shop", "users"], sampleColumns, caps)).collection).toBe("users");
+  test("MongoDB's Generate Query names the collection and its database too", () => {
+    const parsed = JSON.parse(generateSelectQuery(["sample_shop", "users"], sampleColumns, mongoCaps));
+    expect(parsed.collection).toBe("users");
+    expect(parsed.database).toBe("sample_shop");
+  });
+
+  test("the database is the segment the declaration assigns to its level, never path[0]", () => {
+    // Standing ruling 5g. MongoDB declares one level, so `path[0]` would pass every other
+    // test in this file; a second level in front of it is what tells the two apart.
+    const caps = makeCaps({
+      queryLanguage: "json",
+      defaultPort: null,
+      containerLevels: [
+        { id: "catalog", label: "Catalog", labelPlural: "Catalogs" },
+        { id: "schema", label: "Database", labelPlural: "Databases" },
+      ],
+    });
+    expect(JSON.parse(generateTableQuery(["outer", "sample_shop", "users"], caps)).database).toBe("sample_shop");
+    expect(JSON.parse(generateSelectQuery(["outer", "sample_shop", "users"], sampleColumns, caps)).database).toBe(
+      "sample_shop",
+    );
+  });
+
+  test("a path that does not match the declared levels is refused, not addressed by guess", () => {
+    // One segment on an engine that declares a database level has lost its database:
+    // emitting no key would read the connected database's same-named collection, which is
+    // the #843 wrong answer again.
+    expect(() => generateTableQuery(["users"], mongoCaps)).toThrow("[schema, name]");
+    expect(() => generateTableQuery(["a", "b", "users"], mongoCaps)).toThrow("[schema, name]");
+    // A declared level that is not the database level cannot be read as one.
+    const noDatabaseLevel = makeCaps({
+      queryLanguage: "json",
+      defaultPort: null,
+      containerLevels: [{ id: "catalog", label: "Catalog", labelPlural: "Catalogs" }],
+    });
+    expect(() => generateTableQuery(["outer", "users"], noDatabaseLevel)).toThrow('"schema" container level');
   });
 
   test("Redis takes the bare key, never the database segment with it", () => {
@@ -1189,5 +1237,346 @@ describe("the dialects that address one key or collection, not a qualified name"
     expect(generateTableQuery(["travel", "inventory", "hotel"], makeCaps({ defaultPort: 8091 }))).toBe(
       "SELECT META(d).id AS __id, d.* FROM `travel`.`inventory`.`hotel` AS d;",
     );
+  });
+});
+
+// ============================================================================
+// PromQL (#1085): a metric is addressed by a selector, never by a quoted path
+// ============================================================================
+
+/** The capabilities #1085 section 6.3 gives Prometheus, varied from the SQL helper only where it says. */
+const promqlCaps = makeCaps({
+  queryLanguage: "promql",
+  defaultPort: 9090,
+  statementTerminator: "none",
+  supportsExplain: false,
+  supportsExternalQueryLimiting: false,
+  supportsCreateTable: false,
+  supportsInlineRowEdit: false,
+  supportsMaintenance: false,
+  supportsConnectionString: false,
+});
+
+/**
+ * The names #1085 S4 names, each of which a bare selector would misread or break out of: `nan` and
+ * `Inf` lex as numbers, `sum` as an aggregator, and the rest carry a quote, a backslash, a line
+ * feed, or a text built to close the matcher and open a second selector. Each maps to the one
+ * braced selector #1085 S4 gives it, `{__name__=` then the name as a JSON string then `}`, spelled
+ * as raw text so every backslash is literal.
+ */
+const ESCAPED_NAMES: readonly (readonly [label: string, name: string, selector: string])[] = [
+  ["nan, which the lexer reads as a number", "nan", '{__name__="nan"}'],
+  ["Inf, in any case", "Inf", '{__name__="Inf"}'],
+  ["sum, an aggregator", "sum", '{__name__="sum"}'],
+  ["a name holding a line feed", "a\nb", String.raw`{__name__="a\nb"}`],
+  [
+    "a name built to close the matcher and open a second selector",
+    'x"} or {__name__=~".+',
+    String.raw`{__name__="x\"} or {__name__=~\".+"}`,
+  ],
+  ["a quote", 'a"b', String.raw`{__name__="a\"b"}`],
+  ["a backslash", "a\\b", String.raw`{__name__="a\\b"}`],
+];
+
+/**
+ * The name a braced selector addresses, read back out of it: a `__name__` matcher holds exactly
+ * one JSON-quoted string, and decoding it must give back the name the selector was built for.
+ */
+const nameInBracedSelector = (selector: string): string | undefined => {
+  const match = /^\{__name__=("(?:[^"\\]|\\.)*")\}$/.exec(selector);
+  return match === null ? undefined : (JSON.parse(match[1]!) as string);
+};
+
+/** A label name built to leave a selector if anything ever wrote a column into the text. */
+const hostileLabelColumns: ColumnSchema[] = [
+  { name: 'job"} or vector(1) #\nup', type: "string", nullable: true, isPrimary: false },
+];
+
+describe("PromQL tree click (#1085)", () => {
+  test("a tree click on a metric runs its bare selector, and nothing else", () => {
+    expect(generateTableQuery(["http_requests_total"], promqlCaps)).toBe("http_requests_total");
+    // The control: the same path on the SQL helper is the SELECT a PromQL connection would have
+    // been sent without the arm, so the text above is the arm's and not the name's.
+    expect(generateTableQuery(["http_requests_total"], makeCaps())).toBe("SELECT * FROM http_requests_total;");
+  });
+
+  test("a legacy name with colons, a recording rule's output, stays bare", () => {
+    expect(generateTableQuery(["job:http_requests:rate5m"], promqlCaps)).toBe("job:http_requests:rate5m");
+  });
+
+  test.each(ESCAPED_NAMES)(
+    "a tree click on %s runs one braced selector that decodes to the name",
+    (_label, name, selector) => {
+      const text = generateTableQuery([name], promqlCaps);
+      expect(text).toBe(selector);
+      expect(text.split("\n")).toHaveLength(1);
+      expect(nameInBracedSelector(text)).toBe(name);
+      // One builder: the text is metricSelector's answer, never a second escaper's.
+      expect(text).toBe(metricSelector(name));
+    },
+  );
+
+  test("the metric's columns never reach the click's text", () => {
+    expect(generateTableQuery(["up"], promqlCaps, hostileLabelColumns)).toBe("up");
+  });
+});
+
+// ============================================================================
+// Kafka (#1088): a topic click is a JSON read request, never a MongoDB document
+// ============================================================================
+
+/** The capabilities #1088 section 6.2 gives Kafka, varied from the SQL helper only where it says. */
+const kafkaCaps = makeCaps({
+  queryLanguage: "json",
+  queryDialect: "kafka",
+  defaultPort: 9092,
+  statementTerminator: "none",
+  supportsExplain: false,
+  supportsExternalQueryLimiting: false,
+  supportsCreateTable: false,
+  supportsInlineRowEdit: false,
+  supportsMaintenance: false,
+  supportsConnectionString: false,
+  containerLevels: [],
+});
+
+describe("Kafka tree click (#1088)", () => {
+  test("a tree click on a topic reads its latest 50 messages, as one JSON read request", () => {
+    const text = generateTableQuery(["orders"], kafkaCaps);
+    expect(text).toBe(JSON.stringify({ topic: "orders", from: "latest", limit: 50 }, null, 2));
+    expect(JSON.parse(text)).toEqual({ topic: "orders", from: "latest", limit: 50 });
+    expect(text).not.toContain('"collection"');
+    // The control: the same path on a JSON engine with no dialect is the MongoDB `find` a Kafka
+    // connection would have been sent without the arm, so the text above is the arm's own.
+    const mongodb = makeCaps({ queryLanguage: "json", containerLevels: [] });
+    expect(JSON.parse(generateTableQuery(["orders"], mongodb))).toMatchObject({
+      collection: "orders",
+      operation: "find",
+    });
+  });
+
+  test.each([
+    ["a quote", 'or"ders'],
+    ["a backslash", "or\\ders"],
+    ["a line feed", "or\nders"],
+    ["a key-shaped name", '"},{"topic":"other'],
+    ["an Object.prototype member", "__proto__"],
+  ])("a topic named with %s is written through JSON.stringify and reads back unchanged", (_label, topic) => {
+    const text = generateTableQuery([topic], kafkaCaps);
+    const request = JSON.parse(text) as Record<string, unknown>;
+    expect(Object.keys(request)).toEqual(["topic", "from", "limit"]);
+    expect(request.topic).toBe(topic);
+    expect(text).toBe(JSON.stringify({ topic, from: "latest", limit: 50 }, null, 2));
+  });
+
+  test("the topic's own segment is read, and no column reaches the text", () => {
+    // A topic row's path is one segment (no container level), and the generator reads the object's
+    // own segment whatever it is handed, as the other JSON arms do.
+    expect(JSON.parse(generateTableQuery(["app", "orders"], kafkaCaps, sampleColumns))).toEqual({
+      topic: "orders",
+      from: "latest",
+      limit: 50,
+    });
+  });
+
+  test("the click's text is a request the provider's own parser reads as is", () => {
+    // The click auto-executes, so "runs as is" is the provider's parser reading the exact text,
+    // not a claim: the latest 50 messages of the topic, across every partition.
+    expect(parseReadRequest(generateTableQuery(["orders"], kafkaCaps), DEFAULT_QUERY_LIMIT)).toEqual({
+      topic: "orders",
+      from: { kind: "latest" },
+      limit: 50,
+    });
+  });
+});
+
+describe("Kafka Generate Read Request (#1088)", () => {
+  test("opens ONE read request, partition 0 from its earliest offset, which the provider's parser reads as is", () => {
+    const text = generateSelectQuery(["orders"], [], kafkaCaps);
+    // One object, because the tab's whole buffer is sent as one read request (`handleGenerateSelect`
+    // in src/hooks/use-tab-manager.ts) and JSON has no comments to hold alternatives. Not offset 0:
+    // retention moves a partition's earliest offset past 0 on almost every production topic, and an
+    // offset below it is refused as out of range (tests/unit/lib/kafka-generated-read.test.ts).
+    expect(text).toBe(JSON.stringify({ topic: "orders", partition: 0, from: "earliest", limit: 50 }, null, 2));
+    expect(parseReadRequest(text, DEFAULT_QUERY_LIMIT)).toEqual({
+      topic: "orders",
+      partition: 0,
+      from: { kind: "earliest" },
+      limit: 50,
+    });
+    // The control: the same call on a JSON engine with no dialect is the MongoDB `find` a Kafka
+    // connection would have been handed without the arm, so the text above is the arm's own.
+    const mongodb = makeCaps({ queryLanguage: "json", containerLevels: [] });
+    expect(JSON.parse(generateSelectQuery(["orders"], [], mongodb))).toMatchObject({
+      collection: "orders",
+      operation: "find",
+    });
+  });
+
+  test.each([
+    ["a quote", 'or"ders'],
+    ["a backslash", "or\\ders"],
+    ["a line feed", "or\nders"],
+    ["a key-shaped name", '"},{"topic":"other'],
+    ["an Object.prototype member", "__proto__"],
+  ])("a topic named with %s is written through JSON.stringify and reads back unchanged", (_label, topic) => {
+    const text = generateSelectQuery([topic], [], kafkaCaps);
+    const request = JSON.parse(text) as Record<string, unknown>;
+    expect(Object.keys(request)).toEqual(["topic", "partition", "from", "limit"]);
+    expect(request.topic).toBe(topic);
+    expect(text).toBe(JSON.stringify({ topic, partition: 0, from: "earliest", limit: 50 }, null, 2));
+  });
+
+  test("the topic's columns never reach the text: they are fields a message comes back with, not request keys", () => {
+    // The MongoDB arm projects the columns it is handed, and a `projection` key is one the read
+    // request's parser refuses; the topic's own fixed columns are what the tree hands over here.
+    const text = generateSelectQuery(["orders"], KAFKA_TOPIC_COLUMNS, kafkaCaps);
+    expect(text).toBe(generateSelectQuery(["orders"], [], kafkaCaps));
+    expect(parseReadRequest(text, DEFAULT_QUERY_LIMIT).topic).toBe("orders");
+  });
+
+  test("the topic's own segment is read, whatever path it is handed", () => {
+    expect(JSON.parse(generateSelectQuery(["app", "orders"], sampleColumns, kafkaCaps))).toEqual({
+      topic: "orders",
+      partition: 0,
+      from: "earliest",
+      limit: 50,
+    });
+  });
+});
+
+/**
+ * The two quoting helpers on a Kafka connection answer the JSON arm's spelling, the name as it is,
+ * pinned rather than given an arm of their own (#1088, section 3.3): no caller that a Kafka
+ * connection reaches sends what they answer to the broker. `POST /api/db/profile` refuses the
+ * dialect before its SQL branch (tests/api/db/profile.test.ts), both row menus withhold Generate
+ * Test Data on a topic (tests/unit/components/object-tree-row-actions.test.ts,
+ * tests/components/schema-explorer/TableItem.test.tsx), and the import dialog offers no topic as a
+ * target, since it offers only kinds that declare row writes and no Kafka kind declares them
+ * (tests/unit/db/kafka/objects.test.ts).
+ */
+describe("quoteIdentifier and quoteObjectPath on a Kafka path (#1088)", () => {
+  test("answer a topic's name as it is, where the SQL arm would quote it", () => {
+    expect(quoteIdentifier("orders", kafkaCaps)).toBe("orders");
+    expect(quoteObjectPath(["orders"], kafkaCaps)).toBe("orders");
+    // A legal topic name, of Kafka's own characters, that the SQL arm quotes.
+    expect(quoteIdentifier("Orders.v2-eu", kafkaCaps)).toBe("Orders.v2-eu");
+    expect(quoteObjectPath(["Orders.v2-eu"], kafkaCaps)).toBe("Orders.v2-eu");
+    // The control: the same names on the SQL helper are quoted, so the answers above are the JSON arm's.
+    expect(quoteIdentifier("Orders.v2-eu", makeCaps())).toBe('"Orders.v2-eu"');
+    expect(quoteObjectPath(["Orders.v2-eu"], makeCaps())).toBe('"Orders.v2-eu"');
+  });
+});
+
+/**
+ * The lines of a PromQL text the engine evaluates. PromQL reads `#` as a comment to the end of
+ * the line, and every comment these generators write is a whole line of its own, so what is left
+ * once blank lines and `#` lines are dropped is the expression that runs.
+ */
+const runnableLines = (text: string): string[] =>
+  text.split("\n").filter((line) => line.trim() !== "" && !line.trimStart().startsWith("#"));
+
+/** A metric's columns as the inventory reports them: its label names, then timestamp and value (#1085, section 4.2). */
+const metricColumns: ColumnSchema[] = [
+  { name: "job", type: "string", nullable: true, isPrimary: false },
+  { name: "instance", type: "string", nullable: true, isPrimary: false },
+  { name: "timestamp", type: "timestamp", nullable: false, isPrimary: false },
+  { name: "value", type: "float", nullable: false, isPrimary: false },
+];
+
+describe("PromQL Generate Query (#1085)", () => {
+  test("writes one runnable selector, with the range forms of #1085 section 5.1 as comments above it", () => {
+    const text = generateSelectQuery(["http_requests_total"], metricColumns, promqlCaps);
+
+    expect(text).toBe(
+      [
+        '# PromQL for the metric "http_requests_total". Only the last line runs: a line starting with # is a comment.',
+        "# To try a form below, select it after its # and use Run Selected.",
+        "#",
+        "# Every raw sample from the last five minutes, one column per series:",
+        "#   http_requests_total[5m]",
+        "# For a counter: its per-second rate over the last hour, one row a minute:",
+        "#   rate(http_requests_total[5m])[1h:1m]",
+        "#",
+        "# Every series of the metric as of now, one row per series:",
+        "http_requests_total",
+      ].join("\n"),
+    );
+    // Run as it stands, the buffer is exactly one expression: every other line is a # comment.
+    expect(runnableLines(text)).toEqual(["http_requests_total"]);
+  });
+
+  test("the control: the same call on the SQL helper writes a SELECT, so the text above is the arm's", () => {
+    const sql = generateSelectQuery(["http_requests_total"], metricColumns, makeCaps());
+    expect(sql).toContain("SELECT");
+    expect(runnableLines(sql)).not.toEqual(["http_requests_total"]);
+  });
+
+  test.each(ESCAPED_NAMES)(
+    "Generate Query on %s keeps exactly one runnable line, the braced selector",
+    (_label, name, selector) => {
+      const text = generateSelectQuery([name], metricColumns, promqlCaps);
+
+      expect(runnableLines(text)).toEqual([selector]);
+      // Every other line is a whole comment, so no part of the name ended one early.
+      for (const line of text.split("\n")) {
+        if (line !== selector) expect(line.startsWith("#"), JSON.stringify(line)).toBe(true);
+      }
+      // The name reaches the header through commentName, JSON-quoted, and the forms carry the selector.
+      expect(text).toContain(`# PromQL for the metric ${JSON.stringify(name)}.`);
+      expect(text).toContain(`#   ${selector}[5m]`);
+      expect(text).toContain(`#   rate(${selector}[5m])[1h:1m]`);
+    },
+  );
+
+  test("no bound, no terminator and no label name reach the Generate Query text", () => {
+    const text = generateSelectQuery(["up"], hostileLabelColumns, promqlCaps);
+
+    expect(runnableLines(text)).toEqual(["up"]);
+    expect(text).not.toContain("vector(1)");
+    expect(text).not.toContain("LIMIT");
+    expect(text).not.toContain(";");
+    // The control: the SQL arm does project that column, which is exactly what this arm must not do.
+    const sql = generateSelectQuery(["up"], hostileLabelColumns, makeCaps());
+    expect(sql).toContain("vector(1)");
+    expect(sql).toContain(";");
+  });
+});
+
+/**
+ * Every export of the module, classified for a PromQL connection (#1085). The two generators have
+ * a PromQL arm (the two describes above). `objectSegment` answers the last path segment, which is
+ * a metric's name, and has no dialect. `generateCountQuery` answers `null` for PromQL, because
+ * `offersCountQuery` refuses the language (the `prometheus` row of tests/unit/lib/table-count.test.ts,
+ * built from the provider's own capabilities). `shouldRefreshSchema` runs the pattern the connected
+ * provider declares and has no dialect either. `quoteIdentifier` and `quoteObjectPath` write SQL
+ * and MongoDB spellings, and a PromQL connection never reaches them: `POST /api/db/profile`
+ * refuses the language before its SQL branch (tests/api/db/profile.test.ts), both row menus
+ * withhold Generate Test Data on a metric (tests/unit/components/object-tree-row-actions.test.ts,
+ * tests/components/schema-explorer/TableItem.test.tsx), and the import dialog offers no metric as
+ * a target: it offers only objects whose kind declares row writes
+ * (tests/components/DataImportModal.test.tsx), and no Prometheus kind declares them
+ * (tests/unit/db/prometheus/objects.test.ts). `escapeGlob` escapes a Redis `MATCH` glob, and its
+ * only callers outside the Redis generator arm are the key browser's patterns, a surface offered only
+ * where the provider declares `keyScan` (tests/components/sidebar/Sidebar.test.tsx, and Browse Keys in
+ * tests/unit/components/object-tree-row-actions.test.ts), which Prometheus does not: its whole
+ * capability object is pinned in tests/unit/db/prometheus/provider.test.ts. `jsonCommandAddress` is
+ * read only inside a `queryLanguage === "json"` arm: the three generators' own, the profiler's after
+ * the language refusal above, and Generate Test Data's, which no metric row offers. An export added later has
+ * no classification, so this list fails until somebody writes one for it.
+ */
+describe("the module's exports, for a PromQL connection (#1085)", () => {
+  test("every export is one this file has classified", () => {
+    expect(Object.keys(generators).sort()).toEqual([
+      "escapeGlob",
+      "generateCountQuery",
+      "generateSelectQuery",
+      "generateTableQuery",
+      "jsonCommandAddress",
+      "objectSegment",
+      "quoteIdentifier",
+      "quoteObjectPath",
+      "shouldRefreshSchema",
+    ]);
   });
 });

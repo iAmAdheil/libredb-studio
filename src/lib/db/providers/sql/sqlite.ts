@@ -61,7 +61,9 @@ import {
   requireSourceKind,
 } from "../../object-kinds";
 import { comparePaths } from "../../object-path";
+import { unquoteLiteral } from "@/lib/sql/values";
 import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
+import { logger } from "@/lib/logger";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -349,10 +351,25 @@ const OBJECT_FOREIGN_KEYS_SQL = `
 const SOURCE_SQL: Pick<ObjectKindSpec, "hasSource" | "sourceLanguage"> = { hasSource: true, sourceLanguage: "sql" };
 
 const SQLITE_OBJECT_KINDS: readonly ObjectKindSpec[] = [
-  { id: "table", role: "relation", label: "Table", labelPlural: "Tables", acceptsRowWrites: true, ...SOURCE_SQL },
+  // `hasColumns` on the two relation kinds and on neither of the other two (#789). Written
+  // literally rather than derived from BULK_RELATION_TYPES, which holds the same two ids: that
+  // constant is declared after this array, so referencing it here would throw at module init.
+  // The literal is safe because invariant 8 in `tests/helpers/object-surface-conformance.ts`
+  // checks it against this provider's own `describeObject` in both directions, and the engine
+  // fact behind the two abstentions is measured: `pragma_table_xinfo` answers ZERO rows for an
+  // index name and for a trigger name, so an index and a trigger really have no column to draw.
+  {
+    id: "table",
+    role: "relation",
+    label: "Table",
+    labelPlural: "Tables",
+    acceptsRowWrites: true,
+    hasColumns: true,
+    ...SOURCE_SQL,
+  },
   // No `acceptsRowWrites`. SQLite refuses a write to a view outright unless an INSTEAD OF
   // trigger carries it, which is a per-OBJECT fact a per-kind declaration cannot state.
-  { id: "view", role: "relation", label: "View", labelPlural: "Views", ...SOURCE_SQL },
+  { id: "view", role: "relation", label: "View", labelPlural: "Views", hasColumns: true, ...SOURCE_SQL },
   { id: "index", role: "config", label: "Index", labelPlural: "Indexes", ...SOURCE_SQL },
   { id: "trigger", role: "attached", label: "Trigger", labelPlural: "Triggers", attachedTo: "table", ...SOURCE_SQL },
 ];
@@ -796,6 +813,19 @@ function objectPath(container: readonly string[], row: ObjectRow): string[] {
 }
 
 /**
+ * The VALUE a column defaults to, read out of the catalog text (#1029). SQLite reports a
+ * default as the expression AS WRITTEN, so a string default arrives as the quoted literal
+ * `'abc'`. `unquoteLiteral` decodes exactly one complete literal with this dialect's
+ * escaping and answers `undefined` for anything else, which is what lets a number such as
+ * `42` or an expression such as `CURRENT_TIMESTAMP` through unchanged. The text itself is
+ * kept alongside as `defaultExpression`, because once decoded this is no longer something
+ * that can be pasted after the word DEFAULT.
+ */
+function readCatalogDefault(raw: string | null | undefined): string | undefined {
+  return raw === null || raw === undefined ? undefined : (unquoteLiteral(raw, "sqlite") ?? raw);
+}
+
+/**
  * ONE object's detail, from rows, for BOTH the single read and the bulk read (#789).
  *
  * One mapper and not two, because two are two chances for `describeObjects` to spell a
@@ -831,7 +861,8 @@ function objectDetailFromRows(path: readonly string[], rows: ObjectDetailRows): 
       // so `=== 1` reports the second key column as ordinary. Measured on
       // `PRIMARY KEY (region, year)`.
       isPrimary: row.pk > 0,
-      defaultValue: row.dflt_value ?? undefined,
+      defaultValue: readCatalogDefault(row.dflt_value),
+      defaultExpression: row.dflt_value ?? undefined,
     })),
     indexes: rows.indexes.map((row) => ({
       name: row.name,
@@ -846,6 +877,70 @@ function objectDetailFromRows(path: readonly string[], rows: ObjectDetailRows): 
       referencedColumn: row.to ?? row.parent_key ?? "",
     })),
   };
+}
+
+// ============================================================================
+// A database file this process cannot write
+// ============================================================================
+
+/**
+ * The `access()` refusals that mean "this process may not write here": no permission
+ * (`EACCES`, `EPERM`) or a read-only filesystem (`EROFS`, a `:ro` Docker mount). Any
+ * other answer is a real failure and is raised as one.
+ */
+const NOT_WRITABLE_CODES: ReadonlySet<string> = new Set(["EACCES", "EPERM", "EROFS"]);
+
+/**
+ * True when `dbPath` names an existing file that this process cannot write, or whose
+ * directory it cannot write. The directory counts because the WAL journal the editor
+ * turns on keeps its `-wal` and `-shm` files beside the database. A missing file answers
+ * false: the editor creates it, exactly as before.
+ */
+function isUnwritableExistingFile(dbPath: string): boolean {
+  if (dbPath === ":memory:" || !fs.existsSync(dbPath)) {
+    return false;
+  }
+  for (const target of [dbPath, path.dirname(dbPath)]) {
+    try {
+      fs.accessSync(target, fs.constants.W_OK);
+    } catch (error) {
+      if (NOT_WRITABLE_CODES.has((error as NodeJS.ErrnoException).code ?? "")) {
+        return true;
+      }
+      throw error;
+    }
+  }
+  return false;
+}
+
+/** SQLite's SQLITE_READONLY refusal, in the words both drivers raise it with. */
+function isReadOnlyWriteError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("attempt to write a readonly database");
+}
+
+/**
+ * True when the file's header says WAL journal mode: bytes 18 and 19, the file format
+ * write and read versions, are 2 in WAL mode and 1 under a rollback journal
+ * (https://www.sqlite.org/fileformat2.html#file_format_version_numbers). SQLite's own
+ * words for a refused WAL file differ by build (SQLITE_READONLY from the library bundled
+ * on Linux, SQLITE_CANTOPEN from Apple's, or with a `-wal` left and no `-shm`), so the
+ * header is what says the refusal is about WAL. It is read only to explain a refusal
+ * already raised: a file this process cannot read answers false, and that refusal keeps
+ * SQLite's words alone.
+ */
+function isWalModeFile(dbPath: string): boolean {
+  let fd: number;
+  try {
+    fd = fs.openSync(dbPath, "r");
+  } catch {
+    return false;
+  }
+  try {
+    const header = Buffer.alloc(20);
+    return fs.readSync(fd, header, 0, 20, 0) === 20 && header[18] === 2 && header[19] === 2;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 // ============================================================================
@@ -983,6 +1078,8 @@ export class SQLiteProvider extends SQLBaseProvider {
   private db: SQLiteDatabase | null = null;
   /** True when this instance was opened under the agent read-only profile. */
   private readonly readOnlyProfile: boolean;
+  /** The file's path when the editor opened it read-only because this process cannot write it; else null. */
+  private unwritableFilePath: string | null = null;
 
   constructor(config: DatabaseConnection, options: ProviderOptions = {}, execution: ProviderExecutionContext = {}) {
     super(config, options);
@@ -1080,6 +1177,11 @@ export class SQLiteProvider extends SQLBaseProvider {
         return;
       }
 
+      if (isUnwritableExistingFile(dbPath)) {
+        this.connectUnwritableFile(SQLiteDB, dbPath);
+        return;
+      }
+
       if (dbPath !== ":memory:") {
         const dir = path.dirname(dbPath);
         if (!fs.existsSync(dir)) {
@@ -1123,11 +1225,44 @@ export class SQLiteProvider extends SQLBaseProvider {
         throw error;
       }
 
-      throw new ConnectionError(
-        `Failed to open SQLite database: ${error instanceof Error ? error.message : error}`,
-        "sqlite",
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      // The one read-only open SQLite refuses outright: see `connectUnwritableFile`.
+      const walHint =
+        this.unwritableFilePath !== null && isWalModeFile(this.unwritableFilePath)
+          ? `${this.unwritableFilePath} is open read-only because this process cannot write the file or its directory, and a file in WAL journal mode cannot be read without a -shm file beside it; switch it to a rollback journal (PRAGMA journal_mode = DELETE) where it is writable, or make its directory writable: `
+          : "";
+      throw new ConnectionError(`Failed to open SQLite database: ${walHint}${reason}`, "sqlite");
     }
+  }
+
+  /**
+   * Open, for the editor, an existing file this process cannot write: a read-only
+   * Docker mount, or a file owned by another user. The shared sequence above cannot
+   * open one at all, because `PRAGMA journal_mode = WAL` is a write (and WAL needs its
+   * `-wal` and `-shm` files beside the database), so every read used to fail with
+   * "attempt to write a readonly database".
+   *
+   * The handle is SQLite's own read-only open, without `create` and without the WAL
+   * pair, so reads work and a write is refused by the engine; `query()` names that
+   * refusal. `query_only` is NOT set: this is the editor, and the file's permissions
+   * are the boundary, not a profile.
+   *
+   * A file already in WAL journal mode, with no `-shm` file beside it, still cannot be
+   * opened when its directory is unwritable: SQLite reads one only with a `-shm` file
+   * beside it, and has nowhere to make one (measured on bun:sqlite and node:sqlite,
+   * 2026-09-26). `connect()` names that case, reading it from the file's header because
+   * SQLite words it differently by build (`isWalModeFile`).
+   */
+  private connectUnwritableFile(SQLiteDB: Awaited<ReturnType<typeof loadSQLiteDriver>>, dbPath: string): void {
+    this.unwritableFilePath = dbPath;
+    logger.info(`[SQLite] Opening ${dbPath} read-only: this process cannot write the file or its directory`, {
+      provider: "sqlite",
+    });
+    this.db = new SQLiteDB(dbPath, { readonly: true });
+    this.db.exec("PRAGMA foreign_keys = ON");
+    // A file in WAL mode fails here rather than at the open: SQLite opens its files lazily.
+    this.db.prepare("PRAGMA journal_mode").get();
+    this.setConnected(true);
   }
 
   /**
@@ -1256,6 +1391,13 @@ export class SQLiteProvider extends SQLBaseProvider {
             };
           }
         } catch (error) {
+          if (this.unwritableFilePath !== null && isReadOnlyWriteError(error)) {
+            throw new QueryError(
+              `SQLite database ${this.unwritableFilePath} is open read-only because this process cannot write the file or its directory: ${(error as Error).message}`,
+              "sqlite",
+              sql,
+            );
+          }
           throw mapDatabaseError(error, "sqlite", sql);
         }
       });
@@ -1798,28 +1940,50 @@ export class SQLiteProvider extends SQLBaseProvider {
   // Health & Monitoring
   // ============================================================================
 
+  /**
+   * The database's size in bytes, or absent when it genuinely cannot be read (#546).
+   *
+   * `getHealth()` and `getOverview()` both used to read this size themselves, and
+   * drifted: `getHealth()` caught a failed file stat to `"Unknown"` and a failed
+   * `:memory:` read to `"N/A"`, `getOverview()` initialized to `0` and left it
+   * there through an empty catch either way, and neither result was a measurement
+   * - a read that never answered is not the same fact as a database that is
+   * genuinely empty. One reader now decides both, so the two panels cannot
+   * disagree about the same database again, and the review that caught the
+   * :memory: half of this - `result?.size || 0` cannot tell a measured zero from
+   * `sizeStmt.get()` returning no row, or a row whose `size` is `undefined` - is
+   * fixed once here rather than twice.
+   */
+  private readDatabaseSizeBytes(): number | undefined {
+    const dbPath = this.getDatabasePath();
+    if (dbPath !== ":memory:") {
+      try {
+        return fs.statSync(dbPath).size;
+      } catch {
+        // Absent: the catch cannot tell "file does not exist yet" apart from any
+        // other statSync failure.
+        return undefined;
+      }
+    }
+    try {
+      const sizeStmt = this.db!.prepare(MEMORY_DB_SIZE_SQL);
+      const result = sizeStmt.get() as { size?: number };
+      // A type check, not `|| 0`: page_count * page_size answering a real zero is
+      // a measured reading, kept - but `|| 0` cannot tell that apart from
+      // `get()` returning no row, or a row whose `size` came back `undefined`,
+      // both of which `as { size: number }` casts past rather than rules out.
+      return typeof result?.size === "number" ? result.size : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   public async getHealth(): Promise<HealthInfo> {
     this.ensureConnected();
 
     const dbPath = this.getDatabasePath();
-
-    let databaseSize = "N/A";
-    if (dbPath !== ":memory:") {
-      try {
-        const stats = fs.statSync(dbPath);
-        databaseSize = formatBytes(stats.size);
-      } catch {
-        databaseSize = "Unknown";
-      }
-    } else {
-      try {
-        const sizeStmt = this.db!.prepare(MEMORY_DB_SIZE_SQL);
-        const result = sizeStmt.get() as { size: number };
-        databaseSize = formatBytes(result?.size || 0);
-      } catch {
-        databaseSize = "N/A";
-      }
-    }
+    const sizeBytes = this.readDatabaseSizeBytes();
+    const databaseSize = sizeBytes === undefined ? "N/A" : formatBytes(sizeBytes);
 
     let isHealthy = true;
     try {
@@ -1930,26 +2094,9 @@ export class SQLiteProvider extends SQLBaseProvider {
     const versionResult = versionStmt.get() as { version: string };
     const version = `SQLite ${versionResult?.version || "Unknown"}`;
 
-    // Get database size
-    const dbPath = this.getDatabasePath();
-    let databaseSizeBytes = 0;
-
-    if (dbPath !== ":memory:") {
-      try {
-        const stats = fs.statSync(dbPath);
-        databaseSizeBytes = stats.size;
-      } catch {
-        // File might not exist yet
-      }
-    } else {
-      try {
-        const sizeStmt = this.db!.prepare(MEMORY_DB_SIZE_SQL);
-        const result = sizeStmt.get() as { size: number };
-        databaseSizeBytes = result?.size || 0;
-      } catch {
-        // Ignore
-      }
-    }
+    // Get database size, absent rather than 0 when it cannot be read (#546) - see
+    // `readDatabaseSizeBytes()` above, shared with `getHealth()`.
+    const sizeBytes = this.readDatabaseSizeBytes();
 
     // Get table count
     const tableCountStmt = this.db!.prepare(TABLE_COUNT_SQL);
@@ -1966,8 +2113,11 @@ export class SQLiteProvider extends SQLBaseProvider {
       uptime: "N/A",
       activeConnections: 1,
       maxConnections: 1,
-      databaseSize: formatBytes(databaseSizeBytes),
-      databaseSizeBytes,
+      // "N/A", not formatBytes(0): moves with the figure, so an unanswered read
+      // does not print a confident "0 Bytes" beside the Storage tab's own absence
+      // message.
+      databaseSize: sizeBytes === undefined ? "N/A" : formatBytes(sizeBytes),
+      ...(sizeBytes === undefined ? {} : { databaseSizeBytes: sizeBytes }),
       tableCount,
       indexCount,
     };

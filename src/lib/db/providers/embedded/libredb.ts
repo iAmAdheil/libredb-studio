@@ -47,7 +47,14 @@ import {
   type ObjectDetailBatch,
   type ObjectKindSpec,
 } from "../../types";
-import { callerBoundTruncationReason, containerDepth, declaredKinds, findKind } from "../../object-kinds";
+import {
+  assertObjectPathShape,
+  callerBoundTruncationReason,
+  containerDepth,
+  declaredKinds,
+  findKind,
+  type ObjectPathShapeEngine,
+} from "../../object-kinds";
 import { comparePaths } from "../../object-path";
 import { DatabaseConfigError, ConnectionError, QueryError } from "../../errors";
 import { formatBytes } from "../../utils/pool-manager";
@@ -182,11 +189,18 @@ export const LIBREDB_TABLE_STATS_TRUNCATED = `LibreDB keeps no row counter, so t
  * `describeObject` answers as the table's columns, no statement in this grammar could
  * re-apply an edited one, and `recordRelational` throws on a schema mismatch rather than
  * migrating. `docs/providers/libredb.md` section 6.1 carries the measurement in full.
+ *
+ * EVERY kind declares `hasColumns`, which is unusual in the fleet and is measured rather
+ * than assumed: `columnsForGroup` below has exactly three arms, one per kind, and none of
+ * them can answer an empty list - a cataloged table answers its declared column map, a
+ * cataloged collection answers the id/document pair, and a derived grouping answers the
+ * key/value pair. So invariant 8's negative direction has nothing to iterate here and the
+ * suite states `noAbstainingKinds`.
  */
 const LIBREDB_OBJECT_KINDS: readonly ObjectKindSpec[] = Object.freeze([
-  { id: "table", role: "relation", label: "Table", labelPlural: "Tables" },
-  { id: "collection", role: "relation", label: "Collection", labelPlural: "Collections" },
-  { id: "keyspace", role: "relation", label: "Key Prefix", labelPlural: "Key Prefixes" },
+  { id: "table", role: "relation", label: "Table", labelPlural: "Tables", hasColumns: true },
+  { id: "collection", role: "relation", label: "Collection", labelPlural: "Collections", hasColumns: true },
+  { id: "keyspace", role: "relation", label: "Key Prefix", labelPlural: "Key Prefixes", hasColumns: true },
 ] as const);
 
 /**
@@ -250,6 +264,20 @@ const KEY_SCAN_SAMPLE_SENTENCE = `the first ${LIBREDB_MAX_KEY_SCAN.toLocaleStrin
  * wording.
  */
 const SCAN_BOUND_SENTENCE = `the key walk stopped at ${KEY_SCAN_SAMPLE_SENTENCE}`;
+
+/**
+ * LibreDB's identity for the shared path-shape renderer.
+ *
+ * `attachedSegment` is inert here: no kind this provider declares carries `attachedTo`, so
+ * the renderer produces the single declared-levels-plus-name shape and never consults the
+ * attached policy. `"required"` is what every engine that declares no attached kind passes,
+ * since the arm is unreachable either way.
+ */
+const LIBREDB_PATH_SHAPE_ENGINE: ObjectPathShapeEngine = {
+  code: "libredb",
+  label: "A LibreDB",
+  attachedSegment: "required",
+};
 
 /**
  * The container levels this provider declares, sliced to the depth `containerDepth()`
@@ -972,20 +1000,10 @@ export class LibreDBProvider extends BaseDatabaseProvider {
   public async describeObject(path: readonly string[], kind: string): Promise<ObjectDetail> {
     this.ensureConnected();
     const capabilities = this.getCapabilities();
-    this.assertDeclaredKind(capabilities, kind);
-
-    // Derived, not counted: the depth comes from `containerDepth()` through
-    // `declaredLevels`, and the names in the message are the declared labels, so the
-    // check and its message cannot disagree. No kind declares `attachedTo`, so there is
-    // one shape rather than two.
+    const spec = this.assertDeclaredKind(capabilities, kind);
     const levels = declaredLevels(capabilities);
-    if (path.length !== levels.length + 1) {
-      throw new QueryError(
-        `A LibreDB "${kind}" path is [${[...levels.map((level) => level.label.toLowerCase()), "name"].join(", ")}], ` +
-          `received ${JSON.stringify(path)}`,
-        "libredb",
-      );
-    }
+
+    assertObjectPathShape(capabilities, spec, kind, path, LIBREDB_PATH_SHAPE_ENGINE);
 
     // The LAST segment and never `path[0]`: at depth 2 the first segment is a container.
     const name = path[path.length - 1];
@@ -1104,11 +1122,17 @@ export class LibreDBProvider extends BaseDatabaseProvider {
     return { details, truncated: { limit: bounded ? limit! : details.length, reason: reasons.join(", and ") } };
   }
 
-  /** One spelling of the declaration check, so two methods cannot refuse by two rules. */
-  private assertDeclaredKind(capabilities: ProviderCapabilities, kind: string): void {
-    if (findKind(capabilities, kind) === undefined) {
+  /** One spelling of the declaration check, so two methods cannot refuse by two rules.
+   *
+   * Returns the spec it resolved: the callers need the resolved kind next, and resolving it
+   * twice in the same method means one lookup decides the refusal and a second decides the
+   * shape. */
+  private assertDeclaredKind(capabilities: ProviderCapabilities, kind: string): ObjectKindSpec {
+    const spec = findKind(capabilities, kind);
+    if (spec === undefined) {
       throw new QueryError(`LibreDB declares no object kind "${kind}"`, "libredb");
     }
+    return spec;
   }
 
   // --------------------------------------------------------------------------
@@ -1140,13 +1164,17 @@ export class LibreDBProvider extends BaseDatabaseProvider {
 
   public async getOverview(): Promise<DatabaseOverview> {
     this.ensureConnected();
+    const sizeBytes = this.fileSizeBytes();
     return {
       version: this.dbVersion,
       uptime: "-",
       activeConnections: 1,
       maxConnections: 1,
-      databaseSize: this.fileSizeHuman(),
-      databaseSizeBytes: this.fileSizeBytes(),
+      // "N/A", not formatBytes(0): moves with the figure, so a read that never
+      // answered does not print a confident "0 Bytes" beside the Storage tab's own
+      // absence message (#546).
+      databaseSize: sizeBytes === undefined ? "N/A" : formatBytes(sizeBytes),
+      ...(sizeBytes === undefined ? {} : { databaseSizeBytes: sizeBytes }),
       // Counted from the same key walk every other surface on this engine reads, rather
       // than from a second enumeration: `scanGroups` is what `listObjects` and
       // `countObjects` walk, so the Overview card and the object tree cannot disagree
@@ -1234,7 +1262,10 @@ export class LibreDBProvider extends BaseDatabaseProvider {
         name: "File",
         location: this.dbPath ?? this.config.database ?? "",
         size: this.fileSizeHuman(),
-        sizeBytes: this.fileSizeBytes(),
+        // `StorageStats.sizeBytes` is a required number with no optional
+        // counterpart (unlike `DatabaseOverview.databaseSizeBytes` above), so an
+        // absent read is coerced to 0 here rather than propagated.
+        sizeBytes: this.fileSizeBytes() ?? 0,
       },
     ];
   }
@@ -1247,15 +1278,26 @@ export class LibreDBProvider extends BaseDatabaseProvider {
   // Helpers
   // --------------------------------------------------------------------------
 
-  private fileSizeBytes(): number {
+  /**
+   * Absent, not 0, when the size genuinely cannot be read (#546): no `dbPath` at
+   * all, or `statSync` throwing for any reason - a file not yet created, a
+   * permission refusal, anything else - are all the same "no figure arrived" to a
+   * caller, and `DatabaseOverview.databaseSizeBytes` is optional exactly so that
+   * can be said rather than faked as a measured zero (src/lib/db/types.ts).
+   * `getStorageStats()` below coerces this back to 0 at its own call site,
+   * because its `sizeBytes` is a required field with no optional counterpart.
+   */
+  private fileSizeBytes(): number | undefined {
+    if (!this.dbPath) return undefined;
     try {
-      return this.dbPath ? fs.statSync(this.dbPath).size : 0;
+      return fs.statSync(this.dbPath).size;
     } catch {
-      return 0;
+      return undefined;
     }
   }
 
   private fileSizeHuman(): string {
-    return formatBytes(this.fileSizeBytes());
+    const sizeBytes = this.fileSizeBytes();
+    return sizeBytes === undefined ? "N/A" : formatBytes(sizeBytes);
   }
 }

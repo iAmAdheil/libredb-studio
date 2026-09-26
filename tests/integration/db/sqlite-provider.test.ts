@@ -9,7 +9,9 @@
 
 import { describe, test, expect, afterEach, beforeAll, afterAll, spyOn } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { Database as BunDatabase, constants as sqliteConstants } from "bun:sqlite";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -23,6 +25,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
+/** A namespace import, not the named `statSync` above: `spyOn` needs an object it can
+ * reassign a property on, and this is the same module object the provider's own
+ * `import * as fs from "fs"` reads `statSync` off. */
+import * as fsNode from "node:fs";
 
 /** The repository root, anchored to this file so nothing here depends on the launcher's cwd. */
 const REPO_ROOT = resolve(import.meta.dir, "../../..");
@@ -38,6 +44,7 @@ import {
   declaredKinds,
   isCountUnavailable,
   isSourcePartUnavailable,
+  kindHasColumns,
   sourceBoundTruncationReason,
 } from "@/lib/db/object-kinds";
 import { flattenTree } from "@/components/object-tree/flatten";
@@ -57,6 +64,8 @@ import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
 import { buildResultExport } from "@/lib/export/result-export";
 import { comparePaths } from "@/lib/db/object-path";
 import { readFixtureStatements } from "../../../docker/sqlite-init/build-fixture";
+import { logger } from "@/lib/logger";
+import { MISSING_POSIX_FILE_MODES, describeIf, testIf } from "../../helpers/posix-tools";
 
 // ============================================================================
 // Helpers
@@ -572,6 +581,48 @@ describe("SQLiteProvider", () => {
       expect(overview.activeConnections).toBe(1);
       expect(overview.maxConnections).toBe(1);
     });
+
+    // Review on #1050: `result?.size || 0` cannot tell a measured zero apart from
+    // `sizeStmt.get()` answering no row, or a row whose `size` came back
+    // `undefined` - `as { size: number }` casts past both rather than ruling them
+    // out. `page_count * page_size` never actually produces either in real
+    // operation, so both are reproduced here by intercepting the statement.
+    describe("a :memory: size read that answers no measurement", () => {
+      test("no row at all leaves databaseSizeBytes absent, not 0", async () => {
+        provider = new SQLiteProvider(makeSQLiteConfig());
+        await provider.connect();
+        answerReadsMatching(provider, "page_count", []);
+
+        const overview = await provider.getOverview();
+        expect(overview.databaseSizeBytes).toBeUndefined();
+        expect("databaseSizeBytes" in overview).toBe(false);
+        expect(overview.databaseSize).toBe("N/A");
+      });
+
+      test("a row whose size is undefined leaves databaseSizeBytes absent, not 0", async () => {
+        provider = new SQLiteProvider(makeSQLiteConfig());
+        await provider.connect();
+        answerReadsMatching(provider, "page_count", [{ size: undefined }]);
+
+        const overview = await provider.getOverview();
+        expect(overview.databaseSizeBytes).toBeUndefined();
+        expect("databaseSizeBytes" in overview).toBe(false);
+        expect(overview.databaseSize).toBe("N/A");
+      });
+
+      // The control: a real zero (an edge case in principle, since page_count and
+      // page_size are never actually 0 on a real :memory: handle) is a
+      // measurement and must be kept, not folded into the same absence.
+      test("a row whose size really is 0 is kept as a measurement", async () => {
+        provider = new SQLiteProvider(makeSQLiteConfig());
+        await provider.connect();
+        answerReadsMatching(provider, "page_count", [{ size: 0 }]);
+
+        const overview = await provider.getOverview();
+        expect(overview.databaseSizeBytes).toBe(0);
+        expect(overview.databaseSize).not.toBe("N/A");
+      });
+    });
   });
 
   // --------------------------------------------------------------------------
@@ -902,6 +953,26 @@ describe("SQLiteProvider", () => {
       expect(health.activeSessions[0].database).toBe("health.db");
     });
 
+    // Review on #1050: `getHealth()` used to report a failed file stat as
+    // "Unknown" while `getOverview()` reported the same failure as "N/A" - two
+    // different sentences for the same unmeasured database. Both now read the
+    // same helper and say the same thing.
+    test("getHealth reads N/A, not Unknown, when the file cannot be stat'd", async () => {
+      const dbPath = join(fileTmpDir, "unreadable-health.db");
+      provider = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }));
+      await provider.connect();
+      await provider.query("CREATE TABLE h (id INTEGER PRIMARY KEY)");
+
+      const spy = spyOn(fsNode, "statSync").mockImplementation(() => {
+        throw new Error("EACCES: permission denied, stat");
+      });
+      try {
+        expect((await provider.getHealth()).databaseSize).toBe("N/A");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
     test("getOverview reads the database size from the file", async () => {
       const dbPath = join(fileTmpDir, "overview.db");
       provider = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }));
@@ -911,6 +982,37 @@ describe("SQLiteProvider", () => {
       const overview = await provider.getOverview();
       expect(overview.databaseSizeBytes).toBeGreaterThan(0);
       expect(overview.tableCount).toBe(1);
+    });
+
+    // `databaseSizeBytes` used to be initialised to 0 and left there by an empty
+    // catch, so a read that never answered published a measured-looking zero
+    // indistinguishable from a genuinely empty database (#546). It is optional
+    // exactly so a failed read can say nothing instead (src/lib/db/types.ts).
+    //
+    // `statSync` is mocked rather than deleting the file out from under the
+    // connection: a bun:sqlite handle over a removed file answers "disk I/O
+    // error" on the VERY NEXT query too (measured), which would take the table
+    // and index counts down with it and test a different failure than this one.
+    test("getOverview omits databaseSizeBytes, and databaseSize reads N/A, when the file cannot be stat'd", async () => {
+      const dbPath = join(fileTmpDir, "unreadable.db");
+      provider = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }));
+      await provider.connect();
+      await provider.query("CREATE TABLE v (id INTEGER PRIMARY KEY)");
+
+      const spy = spyOn(fsNode, "statSync").mockImplementation(() => {
+        throw new Error("EACCES: permission denied, stat");
+      });
+      try {
+        const overview = await provider.getOverview();
+        expect(overview.databaseSizeBytes).toBeUndefined();
+        expect("databaseSizeBytes" in overview).toBe(false);
+        expect(overview.databaseSize).toBe("N/A");
+        // The table/index counts come from the open handle, not statSync, so the
+        // rest of the overview is unaffected by the mocked failure.
+        expect(overview.tableCount).toBe(1);
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     test("getStorageStats lists the main database plus WAL and SHM sidecar files", async () => {
@@ -1419,6 +1521,15 @@ describe("SQLiteProvider object surface (#789)", () => {
       // Keyed by the container path joined with "/", so the root container's key is "".
       counts: { "": counts },
       objects: { table: tables },
+      // Nothing is described here, and that is the point of naming both fields rather than
+      // letting a default answer for them. `readsColumns` is the STANDALONE shell's value,
+      // which is what SQLite really renders now that its `table` and `view` declare
+      // `hasColumns`; `details` is empty because `expanded` holds only the folder id, so no
+      // object row is open and no column row can be emitted. This assertion is about the
+      // zero-container arm and stays green either way, which is why both are spelled out
+      // instead of being tuned until it passes.
+      details: {},
+      readsColumns: true,
       containerDepth: containerDepth(capabilities),
     });
 
@@ -1751,6 +1862,45 @@ describe("SQLiteProvider object surface (#789)", () => {
       indexes: [],
       foreignKeys: [],
     });
+  });
+
+  test("declares hasColumns on the two relation kinds, and the engine answers both ways", async () => {
+    // The declaration the object tree draws a twisty from (#789), pinned against this
+    // engine's own answer rather than against the design's table. The two coincide with
+    // `role === "relation"` HERE and that is a coincidence, not the rule: `describeObject`
+    // gates on the role only because `pragma_table_xinfo` answers zero rows for an index
+    // and for a trigger name, measured in the test above.
+    objects = await connectedWithObjects();
+    const kinds = declaredKinds(objects.getCapabilities());
+
+    expect(kinds.filter((kind) => kindHasColumns(kind)).map((kind) => kind.id)).toEqual(["table", "view"]);
+    // Absent rather than `false`: an abstaining kind declares nothing at all, so a kind
+    // that later grows columns cannot be missed by a reader looking only for the field.
+    for (const abstainer of ["index", "trigger"]) {
+      expect(kinds.find((kind) => kind.id === abstainer)?.hasColumns).toBeUndefined();
+    }
+
+    for (const [path, kind] of [
+      [["orders"], "table"],
+      [["order_summary"], "view"],
+    ] as const) {
+      const detail = await objects.describeObject(path, kind);
+      expect(detail.columns.length).toBeGreaterThan(0);
+      // Both fields, and the name check is not cosmetic: the tree feeds `column.name` to
+      // `pathKey`, which calls `segment.replaceAll(...)`, so a non-string name throws
+      // inside the walk and unmounts the whole tree instead of failing one row.
+      for (const column of detail.columns) {
+        expect(typeof column.name).toBe("string");
+        expect(column.name.trim()).not.toBe("");
+        expect(typeof column.type).toBe("string");
+        expect(column.type.trim()).not.toBe("");
+      }
+    }
+
+    // The other direction, which is what keeps the declaration from being a one-way claim:
+    // a kind that declares nothing is a leaf in the tree, so it must answer no column.
+    expect((await objects.describeObject(["idx_orders_customer"], "index")).columns).toEqual([]);
+    expect((await objects.describeObject(["orders", "orders_stamp"], "trigger")).columns).toEqual([]);
   });
 
   test("an object that is not there is a failed read and says so", async () => {
@@ -4243,5 +4393,359 @@ describe("what the row editor reads off a SQLite result (#273)", () => {
     // fact rather than an assumption: SQLite matches this key exactly, once.
     const matched = await editing.query("SELECT note FROM rl WHERE id = ?", [1.5]);
     expect(matched.rows).toEqual([{ note: "first" }]);
+  });
+});
+
+/**
+ * Column defaults as SQLite's catalog reports them (#1029).
+ *
+ * `PRAGMA table_info` publishes `dflt_value` as the expression AS WRITTEN, so a string
+ * default arrives quoted with SQL standard doubling while a number or an expression arrives
+ * bare. Measured on SQLite 3.53.2 through `bun:sqlite`:
+ *
+ *   DEFAULT 'NULL'            -> 'NULL'
+ *   DEFAULT 'abc'             -> 'abc'
+ *   DEFAULT ''                -> ''
+ *   DEFAULT 'it''s'           -> 'it''s'
+ *   DEFAULT 'a\b'             -> 'a\b'
+ *   DEFAULT 42                -> 42
+ *   DEFAULT CURRENT_TIMESTAMP -> CURRENT_TIMESTAMP
+ *
+ * `defaultValue` is the VALUE the column defaults to; `defaultExpression` keeps the text as
+ * the engine wrote it, which is what goes after the word DEFAULT.
+ */
+describe("SQLiteProvider column defaults (#1029)", () => {
+  const DDL = `CREATE TABLE column_defaults (
+    id INTEGER PRIMARY KEY,
+    def_null_string TEXT DEFAULT 'NULL',
+    def_text TEXT DEFAULT 'abc',
+    def_empty TEXT DEFAULT '',
+    def_quote TEXT DEFAULT 'it''s',
+    def_backslash TEXT DEFAULT 'a\\b',
+    def_number INTEGER DEFAULT 42,
+    def_expression TEXT DEFAULT CURRENT_TIMESTAMP
+  )`;
+
+  const EXPECTED: Record<string, { defaultValue?: string; defaultExpression?: string }> = {
+    id: {},
+    def_null_string: { defaultValue: "NULL", defaultExpression: "'NULL'" },
+    def_text: { defaultValue: "abc", defaultExpression: "'abc'" },
+    def_empty: { defaultValue: "", defaultExpression: "''" },
+    def_quote: { defaultValue: "it's", defaultExpression: "'it''s'" },
+    def_backslash: { defaultValue: "a\\b", defaultExpression: "'a\\b'" },
+    def_number: { defaultValue: "42", defaultExpression: "42" },
+    def_expression: { defaultValue: "CURRENT_TIMESTAMP", defaultExpression: "CURRENT_TIMESTAMP" },
+  };
+
+  const defaultsOf = (columns: readonly { name: string; defaultValue?: string; defaultExpression?: string }[]) =>
+    Object.fromEntries(
+      columns.map((column) => [
+        column.name,
+        {
+          ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+          ...(column.defaultExpression === undefined ? {} : { defaultExpression: column.defaultExpression }),
+        },
+      ]),
+    );
+
+  test("a string default is reported as its value, with the catalog text kept alongside", async () => {
+    delete process.env.LIBREDB_SQLITE_DRIVER;
+    const dir = mkdtempSync(join(tmpdir(), "libredb-sqlite-defaults-"));
+    const db = new SQLiteProvider(makeSQLiteConfig({ database: join(dir, "defaults.db") }));
+    try {
+      await db.connect();
+      await db.query(DDL);
+
+      const single = await db.describeObject(["column_defaults"], "table");
+      expect(defaultsOf(single.columns)).toEqual(EXPECTED);
+
+      // The bulk read goes through the same mapper; asserting it too is what catches a fix
+      // applied to one read and not the other, the mistake #795 had to correct.
+      const batch = await db.describeObjects([], "table");
+      const bulk = batch.details.find((detail) => detail.path[0] === "column_defaults")!;
+      expect(defaultsOf(bulk.columns)).toEqual(EXPECTED);
+    } finally {
+      try {
+        await db.disconnect();
+      } catch {
+        // Ignore cleanup errors
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ============================================================================
+// A database file this process cannot write
+// ----------------------------------------------------------------------------
+// A read-only Docker mount, or a file owned by another user. The editor used to open
+// every file read-write with `create` and `PRAGMA journal_mode = WAL`, so such a file
+// could not be opened at all: health, inventory and counts all answered 503 with
+// "attempt to write a readonly database", while the agent's read-only handle read it
+// fine (reproduced 2026-09-26 in Docker as uid 1001 with the file mounted `:ro`).
+//
+// The mode bits are the fixture, so the test cannot run where they mean nothing: root
+// passes every permission check, and Windows enforces no directory mode. The Linux CI job
+// runs as an ordinary user, which is where these lines are covered.
+// ============================================================================
+
+const MISSING_UNWRITABLE_FILE: string | null =
+  MISSING_POSIX_FILE_MODES ??
+  (process.getuid?.() === 0 ? "running as root: file modes do not restrict root, so nothing is unwritable" : null);
+
+/**
+ * A database of three orders in `dir`, then made unwritable: 0444 on the file and 0555 on
+ * the directory. Written with the driver directly rather than through the provider, because
+ * the provider leaves a file in WAL mode, and that is its own fixture (see "a WAL-mode file"
+ * below).
+ *
+ * A WAL fixture is the file alone, with no `-wal` or `-shm` beside it, unless `keepWal`
+ * leaves its `-wal`. Closing removes both on Linux and Windows but not on macOS, where
+ * bun:sqlite links Apple's libsqlite3, which keeps them (docs/providers/sqlite.md §3.2);
+ * with them left in place the read-only open succeeded on the macos-latest runner
+ * (2026-09-26). So the checkpoint moves every row into the file, `PERSIST_WAL` makes every
+ * platform keep the `-wal` alike, and what is not kept goes by hand.
+ */
+function writeUnwritableFixture(dir: string, journalMode: "delete" | "wal", keepWal = false): string {
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "shop.db");
+  const db = new BunDatabase(file, { create: true, readwrite: true });
+  db.exec(`PRAGMA journal_mode = ${journalMode}`);
+  db.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, total REAL)");
+  db.exec("INSERT INTO orders VALUES (1, 'ada', 10.5), (2, 'bob', 20), (3, 'cy', 30.25)");
+  if (journalMode === "wal") {
+    db.fileControl(sqliteConstants.SQLITE_FCNTL_PERSIST_WAL, 1);
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  }
+  db.close(true);
+  if (!keepWal) rmSync(`${file}-wal`, { force: true });
+  rmSync(`${file}-shm`, { force: true });
+  chmodSync(file, 0o444);
+  chmodSync(dir, 0o555);
+  return file;
+}
+
+/** Bundle sqlite-node-harness.ts for Node and run one scenario with the node driver forced. */
+function runNodeHarness(dbPath: string, scenario: string): Record<string, unknown> {
+  const bundleDir = mkdtempSync(join(tmpdir(), "libredb-sqlite-node-unwritable-"));
+  try {
+    const bundlePath = join(bundleDir, "sqlite-node-harness.mjs");
+    const build = spawnSync(
+      process.execPath,
+      [
+        "build",
+        join(import.meta.dir, "sqlite-node-harness.ts"),
+        "--target=node",
+        "--format=esm",
+        "--external",
+        "bun:sqlite",
+        "--outfile",
+        bundlePath,
+      ],
+      { timeout: 60_000 },
+    );
+    if (build.error) throw new Error(`bun build could not run: ${build.error.message}`);
+    if (build.status !== 0) throw new Error(`bun build failed: ${build.stderr?.toString()}`);
+    const run = spawnSync("node", [bundlePath, dbPath, scenario], {
+      env: { ...process.env, LIBREDB_SQLITE_DRIVER: "node" },
+      timeout: 60_000,
+    });
+    if (run.error) throw new Error(`node harness could not run: ${run.error.message}`);
+    if (run.status !== 0) throw new Error(`node harness failed: ${run.stderr?.toString()}`);
+    // The report is the last line; the logger writes to stdout too, and its lines come back
+    // beside the report as `logLines`.
+    const lines = run.stdout.toString().trim().split("\n");
+    const report = JSON.parse(lines.pop()!) as Record<string, unknown>;
+    return { ...report, logLines: lines };
+  } finally {
+    rmSync(bundleDir, { recursive: true, force: true });
+  }
+}
+
+/** The reason a refused WAL-mode file is given, before SQLite's own words. */
+const WAL_REFUSAL = (file: string) =>
+  `Failed to open SQLite database: ${file} is open read-only because this process cannot write the file or its directory, and a file in WAL journal mode cannot be read without a -shm file beside it; switch it to a rollback journal (PRAGMA journal_mode = DELETE) where it is writable, or make its directory writable: `;
+
+const READ_ONLY_INSERT_MESSAGE = (file: string) =>
+  `SQLite database ${file} is open read-only because this process cannot write the file or its directory: attempt to write a readonly database`;
+
+describe("SQLiteProvider on a database file this process cannot write", () => {
+  let root: string;
+  let infoSpy: { mockRestore(): void } | undefined;
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "libredb-sqlite-unwritable-"));
+  });
+
+  afterAll(() => {
+    // The fixtures took the write bit off their directories, and rmSync needs it back.
+    for (const entry of readdirSync(root)) chmodSync(join(root, entry), 0o755);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    infoSpy?.mockRestore();
+    infoSpy = undefined;
+  });
+
+  /** The info lines that announced a read-only open. */
+  function readOnlyDecisions(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls.map(([message]) => String(message)).filter((message) => message.includes("read-only"));
+  }
+
+  describeIf(MISSING_UNWRITABLE_FILE, "with file mode 0444 in a directory with mode 0555", () => {
+    test("connects read-only, answers health, lists objects and runs a SELECT", async () => {
+      const dir = join(root, "readonly");
+      const file = writeUnwritableFixture(dir, "delete");
+      const spy = spyOn(logger, "info");
+      infoSpy = spy;
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      try {
+        await db.connect();
+        expect(db.isConnected()).toBe(true);
+
+        // The decision is logged once, with the path, at info.
+        const decisions = readOnlyDecisions(spy);
+        expect(decisions).toHaveLength(1);
+        expect(decisions[0]).toContain(file);
+
+        const health = await db.getHealth();
+        expect(health.slowQueries.find((sq) => sq.query.includes("Integrity"))!.query).toContain("OK");
+        // Still the file's own rollback journal: nothing tried to switch it to WAL.
+        expect((await db.query("PRAGMA journal_mode")).rows).toEqual([{ journal_mode: "delete" }]);
+
+        expect((await db.listObjects([], "table")).map((object) => object.name)).toEqual(["orders"]);
+        expect((await db.countObjects([])).table).toEqual({ count: 1 });
+
+        const select = await db.query("SELECT customer, total FROM orders ORDER BY id");
+        expect(select.rows).toEqual([
+          { customer: "ada", total: 10.5 },
+          { customer: "bob", total: 20 },
+          { customer: "cy", total: 30.25 },
+        ]);
+      } finally {
+        await db.disconnect();
+      }
+      // A read-only open leaves no sidecar behind, and could not create one anyway.
+      expect(readdirSync(dir)).toEqual(["shop.db"]);
+    });
+
+    test("an INSERT fails with SQLite's read-only error, named as such", async () => {
+      const file = join(root, "readonly", "shop.db");
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      try {
+        await db.connect();
+        const insert = db.query("INSERT INTO orders VALUES (4, 'dee', 1)");
+        await expect(insert).rejects.toBeInstanceOf(QueryError);
+        await expect(insert).rejects.toThrow(READ_ONLY_INSERT_MESSAGE(file));
+        expect((await db.query("SELECT COUNT(*) AS n FROM orders")).rows).toEqual([{ n: 3 }]);
+      } finally {
+        await db.disconnect();
+      }
+    });
+
+    // SQLite reads a WAL-mode file only with a `-shm` file beside it, and a directory it
+    // cannot write gives it nowhere to make one, so even a read-only handle is refused
+    // (measured on bun:sqlite and node:sqlite, 2026-09-26). The provider cannot change
+    // that, but it can say why instead of passing on SQLite's bare refusal. SQLite words
+    // that refusal two ways: Linux's bundled library answers the file alone with
+    // SQLITE_READONLY, and Apple's with SQLITE_CANTOPEN (macos-latest, 2026-09-26). So the
+    // reason is read from the file's header, and SQLite's own words follow it.
+    test("a WAL-mode file is refused with the reason and the way out", async () => {
+      const file = writeUnwritableFixture(join(root, "wal"), "wal");
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      const connect = db.connect();
+      await expect(connect).rejects.toBeInstanceOf(ConnectionError);
+      await expect(connect).rejects.toThrow(
+        WAL_REFUSAL(file) +
+          (process.platform === "darwin" ? "unable to open database file" : "attempt to write a readonly database"),
+      );
+      expect(db.isConnected()).toBe(false);
+    });
+
+    // A `-wal` left beside the file with no `-shm` is SQLITE_CANTOPEN on Linux too.
+    test("a WAL-mode file with its -wal left and no -shm is refused with the same reason", async () => {
+      const dir = join(root, "wal-left");
+      const file = writeUnwritableFixture(dir, "wal", true);
+      expect(readdirSync(dir).sort()).toEqual(["shop.db", "shop.db-wal"]);
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      const connect = db.connect();
+      await expect(connect).rejects.toBeInstanceOf(ConnectionError);
+      await expect(connect).rejects.toThrow(`${WAL_REFUSAL(file)}unable to open database file`);
+      expect(db.isConnected()).toBe(false);
+    });
+
+    // The control: a refusal that has nothing to do with WAL keeps SQLite's words alone.
+    test("a file this process cannot read is refused without the WAL reason", async () => {
+      const dir = join(root, "unreadable");
+      const file = writeUnwritableFixture(dir, "delete");
+      chmodSync(dir, 0o755);
+      chmodSync(file, 0o000);
+      chmodSync(dir, 0o555);
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      const connect = db.connect();
+      await expect(connect).rejects.toBeInstanceOf(ConnectionError);
+      await expect(connect).rejects.toThrow(/^Failed to open SQLite database: unable to open database file$/);
+      expect(db.isConnected()).toBe(false);
+    });
+
+    testIf(
+      nodeDriverTestable ? null : "`node` with node:sqlite is not available on this machine",
+      "the same file under LIBREDB_SQLITE_DRIVER=node (node:sqlite)",
+      () => {
+        const dir = join(root, "readonly");
+        const file = join(dir, "shop.db");
+        const report = runNodeHarness(file, "unwritable");
+        expect(report.runtime).toBe("node");
+        expect(report.driverEnv).toBe("node");
+        expect(report.connected).toBe(true);
+        const decisions = (report.logLines as string[]).filter((line) => line.includes("read-only"));
+        expect(decisions).toHaveLength(1);
+        expect(decisions[0]).toContain(file);
+        expect(report.integrity).toContain("OK");
+        expect(report.journalMode).toEqual([{ journal_mode: "delete" }]);
+        expect(report.tables).toEqual(["orders"]);
+        expect(report.count).toEqual([{ n: 3 }]);
+        expect(report.insertError).toBe(`QueryError: ${READ_ONLY_INSERT_MESSAGE(file)}`);
+        expect(readdirSync(dir)).toEqual(["shop.db"]);
+      },
+    );
+  });
+
+  // The control: the write check must not turn an ordinary file read-only.
+  test("a writable file still opens read-write in WAL mode", async () => {
+    const dir = join(root, "writable");
+    mkdirSync(dir);
+    const spy = spyOn(logger, "info");
+    infoSpy = spy;
+    const db = new SQLiteProvider(makeSQLiteConfig({ database: join(dir, "shop.db") }));
+    try {
+      await db.connect();
+      expect((await db.query("PRAGMA journal_mode")).rows).toEqual([{ journal_mode: "wal" }]);
+      await db.query("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+      expect((await db.query("INSERT INTO t VALUES (1)")).rowCount).toBe(1);
+      expect(readOnlyDecisions(spy)).toEqual([]);
+    } finally {
+      await db.disconnect();
+    }
+  });
+
+  // The write check only turns "you may not write this" into a read-only open. Any other
+  // answer from the filesystem is a real failure and surfaces as one.
+  test("a write check that fails for another reason is raised, not read as read-only", async () => {
+    const dir = join(root, "eio");
+    mkdirSync(dir);
+    const file = join(dir, "shop.db");
+    writeFileSync(file, "");
+    const accessSpy = spyOn(fsNode, "accessSync").mockImplementation(() => {
+      throw Object.assign(new Error("EIO: i/o error, access"), { code: "EIO" });
+    });
+    const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+    try {
+      await expect(db.connect()).rejects.toThrow("Failed to open SQLite database: EIO: i/o error, access");
+      expect(db.isConnected()).toBe(false);
+    } finally {
+      accessSpy.mockRestore();
+    }
   });
 });

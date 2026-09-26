@@ -371,6 +371,25 @@ turso db tokens create <database> --read-only  # read-only, the engine-side answ
 A self-hosted `sqld` started without authentication takes no token at all, and sending an empty one
 is a 400 rather than an anonymous connection — so a connection with no token sends no header.
 
+
+### 4.4 Endpoint validation and redirects
+
+`host` and `port` are validated when the transport is constructed, which happens in `connect()`, so
+a bad value fails Test Connection and never a capability read. A host must be a hostname, an IPv4
+address or an IPv6 address (bracketed or not), and a port must be an integer from 1 to 65535.
+Anything else is a `DatabaseConfigError` that names the field and does not repeat the value.
+Every request URL is built by the shared [`endpoint.ts`](../../src/lib/db/http/endpoint.ts) with
+`URL` and `URLSearchParams` and checked against the intended hostname, port and path before it is
+sent, so no value can move a request to another path or another server. A scheme's default port
+(80 for `http`, 443 for `https`) is left out of the URL the way `URL` serializes it.
+
+Redirects are not followed. Every request sets `redirect: "manual"`, and a 3xx answer becomes a
+`ConnectionError` naming the status and only the origin of its `Location`, since a followed
+redirect would take the token and the statement to wherever the server pointed.
+
+`serverVersion()` answers `null` for every failure by contract ([§3.10](#310-the-version-panel-names-what-the-deployment-publishes)),
+so a redirect from `/version` is one more "no version to show". It is still not followed.
+
 ---
 
 ## 5. Query interface
@@ -542,6 +561,12 @@ holding only the second shape makes this predicate look untestable when it is no
 An `index` and a `trigger` answer three empty arrays without touching the network, which is a true fact
 about those kinds rather than a failed read.
 
+`table` and `view` are therefore the only kinds here that declare `hasColumns`, so they are the only rows
+the object tree gives a twisty and expands into column rows; `index` and `trigger` declare nothing and stay
+leaves, which is what `describeObject()` answering no column for them means (#789).
+Both deployments this one type-id serves, self-hosted sqld and Turso Cloud, read the same pragmas through
+the same transport, so the declaration is one fact about the engine and not per deployment.
+
 For a `table` and a `view` the reads are batched, and that is where this provider stops being
 [sqlite.ts](../../src/lib/db/providers/sql/sqlite.ts): there every read is a call into a file handle, and
 here every read is an HTTP request.
@@ -640,6 +665,36 @@ placeholders by where they appear in the statement text and the select list is w
 file dispatches on statement text and never counted binds, so the suite was green while every
 `describeObject()` foreign key read would have failed against a real server. The bind arity is now
 pinned by an assertion in that suite.
+
+#### Column defaults: the value, with the catalog text kept alongside (#1029)
+
+libSQL reports a column default as the expression AS WRITTEN, through `pragma_table_xinfo`'s `dflt_value`, identical to SQLite's on every row below. A string
+default therefore arrives quoted, with SQL standard quote doubling, while a number and an
+expression arrive bare. Measured 2026-09-21 on SQLite 3.53.2 through `bun:sqlite`, the engine libSQL forks. The payloads this suite
+replays, captured from sqld 0.24.33 (SQLite 3.47.0), carry `customers.country` as `'TR'`,
+quoted the same way, and #1029 measured `@libsql/client` identical on every row:
+
+| DDL | the value the column defaults to | catalog text |
+| --- | --- | --- |
+| `DEFAULT 'NULL'` | `NULL` | `'NULL'` |
+| `DEFAULT 'abc'` | `abc` | `'abc'` |
+| `DEFAULT ''` | the empty string | `''` |
+| `DEFAULT 'it''s'` | `it's` | `'it''s'` |
+| `DEFAULT 'a\b'` | `a\b` | `'a\b'` |
+| `DEFAULT 42` | `42` | `42` |
+| `DEFAULT CURRENT_TIMESTAMP` | the expression | `CURRENT_TIMESTAMP` |
+| no default | none | SQL NULL |
+
+Each column carries both readings. `defaultValue` is the value, decoded by `unquoteLiteral()`
+(`src/lib/sql/values.ts`) with this dialect's `"standard"` escaping, so `'it''s'` reads as
+`it's` and a backslash stays ordinary data. Text that is not exactly one complete literal,
+a number or an expression, passes through unchanged. `defaultExpression` is the
+catalog text itself, which is always valid SQL here and is what the schema-diff migration
+generator writes after the word `DEFAULT`; without it, a decoded `abc` would be emitted as
+`DEFAULT abc`. The empty string default stays the empty string, never `undefined`, and a
+column with no default carries neither field. `readCatalogDefault()` is local to this
+provider, the way per-provider normalization is everywhere else in this tree; the escape
+knowledge it relies on is the shared part.
 
 #### No `rowCount` and no `sizeBytes` on a listed object
 
