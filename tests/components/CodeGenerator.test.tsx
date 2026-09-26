@@ -51,7 +51,9 @@ const declaredTypeSchema: DetailedObject = {
   columns: [
     { name: "id", type: "int unsigned", baseType: "int", nullable: false, isPrimary: true },
     { name: "note", type: "varchar(20)", baseType: "varchar", nullable: true, isPrimary: false },
-    { name: "status", type: "enum('int','text')", baseType: "enum", nullable: true, isPrimary: false },
+    // `kind`, not `status`: `toCamelCase` strips a trailing `s`, so `status` renders as `statu`
+    // in the TypeScript and Zod output, and these assertions should not depend on that.
+    { name: "kind", type: "enum('int','text')", baseType: "enum", nullable: true, isPrimary: false },
   ],
 };
 
@@ -229,14 +231,31 @@ describe("CodeGenerator", () => {
 
   test("an ENUM's VALUES are not a type family (#1033)", () => {
     // The other direction, and the reason the substring mappers are not safe either:
-    // `enum('int','text')` contains the four characters `int`, and Python's mapper is a
-    // substring test, so the declared type alone types this column `int`.
-    const { queryByText, container } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "lentest"]} tableSchema={declaredTypeSchema} />,
-    );
-    fireEvent.click(queryByText("TypeScript Interface")!);
-    fireEvent.click(queryByText("Python Dataclass")!);
-    expect(container.textContent).toContain("status: Optional[str]");
+    // `enum('int','text')` contains the four characters `int`, and the TypeScript, Zod and
+    // Python mappers all test `t.includes("int")`, so the declared type alone types this
+    // column as a number. One assertion per substring mapper, so reverting any ONE of them
+    // to the declaration fails here.
+    for (const [language, want] of [
+      ["TypeScript Interface", "kind: string | null;"],
+      ["Zod Schema", "kind: z.string().nullable(),"],
+      ["Python Dataclass", "kind: Optional[str]"],
+    ] as const) {
+      const { queryByText, container, unmount } = render(
+        <CodeGenerator
+          isOpen
+          onClose={mock(() => {})}
+          tablePath={["app", "lentest"]}
+          tableSchema={declaredTypeSchema}
+        />,
+      );
+      // TypeScript is the default; the other two are picked from the dropdown.
+      if (language !== "TypeScript Interface") {
+        fireEvent.click(queryByText("TypeScript Interface")!);
+        fireEvent.click(queryByText(language)!);
+      }
+      expect(container.textContent).toContain(want);
+      unmount();
+    }
   });
 
   test("footer shows column count and format", () => {

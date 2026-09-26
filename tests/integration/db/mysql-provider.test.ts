@@ -3405,8 +3405,8 @@ const EXPRESSION_DEFAULT = {
 } as const;
 
 /**
- * MariaDB still reports the integer display width that MySQL 8.0.19 deprecated and MySQL
- * 26.7.0 no longer emits, so ONE declaration has two spellings across the fleet. Measured
+ * MariaDB still reports the integer display width that MySQL deprecated in 8.0.17 and stopped
+ * printing in 8.0.19, so ONE declaration has two spellings across the fleet. Measured
  * 2026-09-22 on MySQL 26.7.0 and MariaDB 13.0.2: `INT` is `int` on the first and `int(11)` on
  * the second, while `VARCHAR(20)`, `DECIMAL(12,2)` and `TIMESTAMP` are spelled alike on both.
  *
@@ -4584,8 +4584,8 @@ describe("MySQL object listing and detail", () => {
    * emitting DDL cannot use at all.
    *
    * The two servers agree on every row but `c_unsigned`, and `maria` is that disagreement
-   * measured rather than guessed: MariaDB still reports the integer display width MySQL 8.0.19
-   * deprecated, so `INT UNSIGNED` is `int unsigned` on MySQL and `int(10) unsigned` on
+   * measured rather than guessed: MariaDB still reports the integer display width MySQL stopped
+   * printing in 8.0.19, so `INT UNSIGNED` is `int unsigned` on MySQL and `int(10) unsigned` on
    * MariaDB. One family, two declarations, and only the server knows which - which is why the
    * family rides beside the declaration rather than being parsed back out of it.
    */

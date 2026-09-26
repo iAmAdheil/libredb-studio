@@ -563,7 +563,8 @@ Two things that table settles, neither of which is guessable from the code alone
 What the names deliberately leave out: the length, precision or display width (`decimal`, not
 `decimal(10,2)`), the `unsigned` suffix, and the `point` subtype the protocol does not carry.
 Checked column by column against `information_schema.COLUMNS.DATA_TYPE` for the same 40-column
-table - the same source the schema tree shows - **38 of 39 match exactly**; the one difference is
+table - the family, which the schema tree now carries as `baseType` beside the declared type
+([§7.1](#71-the-object-surface-789)) - **38 of 39 match exactly**; the one difference is
 `POINT`, which arrives as code 255 with nothing to distinguish it from `GEOMETRY`.
 
 `columnTypes` is filled by `query()` and `queryInTransaction()`, and is **absent entirely** when no
@@ -934,9 +935,18 @@ An absent `baseType` therefore says the server draws no distinction for this col
 Both fields are load-bearing, in opposite directions.
 `type` is what a reader SEES and what a reader emitting DDL WRITES: the schema-diff migration generator interpolates it into `CREATE TABLE` and `ADD COLUMN` verbatim, and `varchar` with no length is not a type on either server - `CREATE TABLE t (note varchar)` is error 1064 - so a migration built from the family alone was rejected in full.
 `baseType` is what a reader DECIDING matches against, because a declaration is not a family name: `int unsigned` equals no spelling a `===` knows, and `enum('int','text')` answers a substring test for `int` while being neither an integer nor a number.
-The two are carried side by side rather than one being parsed back out of the other, because that parse is not available: MySQL 8.0.19 deprecated the integer display width and MySQL 26.7.0 no longer emits it, so one `INT UNSIGNED` is spelled two ways across the fleet and only the server knows which.
+The two are carried side by side rather than one being parsed back out of the other, because that parse is not available: one declaration is spelled more than one way across the fleet, and only the server knows which.
+MySQL deprecated the integer display width in 8.0.17 and stopped printing it in 8.0.19, in `SHOW CREATE`, `DESCRIBE` and `information_schema` alike, with two exceptions it still prints: `TINYINT(1)`, which connectors read as a boolean, and any column with `ZEROFILL`.
+Measured on MySQL 26.7.0: `INT` is `int`, `BIGINT(20)` is `bigint`, `TINYINT(1)` is `tinyint(1)` and `INT ZEROFILL` is `int(10) unsigned zerofill`; MariaDB 13.0.2 still prints every width, so its `INT` is `int(11)`.
+Per the 8.0.19 release notes, a table created on an earlier 8.0 keeps its width in `information_schema`, because the data dictionary is not rewritten, so `int(11)` is reachable on a current MySQL too.
 
 `tests/live/mysql-column-type.ts` ([§12.4](#124-optional-verifying-against-a-live-mysql-and-a-live-mariadb)) holds that claim against real servers: it replays the generated `CREATE TABLE` at the server that supplied its columns and requires an accept, and replays the family-only definition it replaces and requires a REFUSAL.
+
+Two consequences for the schema diff, measured and accepted rather than repaired.
+`diffColumns()` compares `type`, and a snapshot taken before this change stored the family, so the same unchanged column now reads as its declaration: every column with a length, a precision and scale, a value list, or `unsigned` reports one spurious `Type changed: varchar → varchar(20)` and one `MODIFY COLUMN` that changes nothing.
+A column whose declaration is its family, such as `text`, `date` or a MySQL `int`, compares equal and reports nothing, and a new snapshot clears the rest.
+The second is not stale data at all: diffing a MariaDB schema against a MySQL 8.0.19+ one reports `Type changed: int(11) → int` for every integer column the two created from the same DDL, except `TINYINT(1)` and `ZEROFILL` columns, which both servers print in full.
+Comparing `baseType` instead would silence both, and would also silence a real `varchar(20)` → `varchar(40)`, which is the change this section exists to carry.
 
 **MariaDB and MySQL do not report a column default the same way, and this surface reads both (#795).**
 MySQL reports the VALUE: a column with no default is SQL NULL, and `DEFAULT 'abc'` reads back as `abc`.
