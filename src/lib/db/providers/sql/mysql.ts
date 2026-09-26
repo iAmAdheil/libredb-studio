@@ -1687,7 +1687,7 @@ interface DetailColumnRow extends RowDataPacket {
    * without it is a read this module did not write.
    */
   column_type: string;
-  /** The type FAMILY, which is `COLUMN_TYPE` with every one of those parts removed. */
+  /** The type FAMILY. A separate catalog column the server reports on its own, not one derived from `COLUMN_TYPE` by stripping parts out of it. */
   data_type: string;
   is_nullable: string;
   column_default: string | null;
