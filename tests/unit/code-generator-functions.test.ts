@@ -31,6 +31,8 @@ describe("toPascalCase", () => {
 
 describe("toCamelCase", () => {
   test("a trailing s is kept", () => expect(toCamelCase("status")).toBe("status"));
+  // This case expected `user` before #1138. That was the defect itself: `toCamelCase()` names
+  // fields, so a column `users` must stay `users`. Only a TYPE name is singularized.
   test("plural name", () => expect(toCamelCase("users")).toBe("users"));
   test("underscore name", () => expect(toCamelCase("order_items")).toBe("orderItems"));
   test("already camel", () => expect(toCamelCase("email")).toBe("email"));
