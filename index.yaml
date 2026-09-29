@@ -4,6 +4,79 @@ entries:
   - annotations:
       artifacthub.io/category: database
       artifacthub.io/changes: |
+        - "New value config.passkeyOrigin, written to PASSKEY_ORIGIN only when set: the public origin people open Studio at (scheme, host and port, no path), such as https://studio.example.com. Passkeys also need config.storageProvider sqlite or postgres and authProvider local, and browsers offer them only over https or on http://localhost; NOTES.txt warns about a value that cannot work. It needs an application image that includes passkey sign-in (#785): appVersion 0.17.0 does not read it, so it acts once an application release moves appVersion. Guide: docs/PASSKEYS.md"
+      artifacthub.io/containsSecurityUpdates: "false"
+      artifacthub.io/images: |
+        - name: libredb-studio
+          image: ghcr.io/libredb/libredb-studio:0.17.0
+          platforms:
+            - linux/amd64
+            - linux/arm64
+      artifacthub.io/license: MIT
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/libredb/libredb-studio#readme
+        - name: Container Image
+          url: https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio
+        - name: Source
+          url: https://github.com/libredb/libredb-studio
+      artifacthub.io/prerelease: "false"
+    apiVersion: v2
+    appVersion: 0.17.0
+    created: "2026-09-29T09:13:04.229457125Z"
+    dependencies:
+    - condition: postgresql.enabled
+      name: postgresql
+      repository: https://charts.bitnami.com/bitnami
+      version: 16.x.x
+    description: Web-based SQL IDE for cloud-native teams supporting eighteen engines
+      - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase,
+      ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra,
+      libSQL, Prometheus and Apache Kafka
+    digest: 2767fff3821962fe4b8ce78c04f9c24483e2bd6f9d7a93ef4675a0a7902fa964
+    home: https://github.com/libredb/libredb-studio
+    icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
+    keywords:
+    - sql
+    - ide
+    - database
+    - postgresql
+    - mysql
+    - mongodb
+    - redis
+    - sqlite
+    - oracle
+    - mssql
+    - couchbase
+    - clickhouse
+    - druid
+    - elasticsearch
+    - opensearch
+    - trino
+    - cassandra
+    - libsql
+    - turso
+    - duckdb
+    - prometheus
+    - promql
+    - kafka
+    - victoriametrics
+    - redpanda
+    - web-ide
+    kubeVersion: '>=1.26.0-0'
+    maintainers:
+    - name: cevheri
+      url: https://github.com/cevheri
+    name: libredb-studio
+    sources:
+    - https://github.com/libredb/libredb-studio
+    type: application
+    urls:
+    - https://github.com/iAmAdheil/libredb-studio/releases/download/libredb-studio-0.1.72/libredb-studio-0.1.72.tgz
+    version: 0.1.72
+  - annotations:
+      artifacthub.io/category: database
+      artifacthub.io/changes: |
         - "Prefix default health probes with config.basePath for images built to run under a subpath"
       artifacthub.io/containsSecurityUpdates: "false"
       artifacthub.io/images: |
@@ -3814,4 +3887,4 @@ entries:
     urls:
     - https://github.com/libredb/libredb-studio/releases/download/libredb-studio-0.1.0/libredb-studio-0.1.0.tgz
     version: 0.1.0
-generated: "2026-09-10T20:55:05.898930156Z"
+generated: "2026-09-29T09:13:04.216742673Z"
