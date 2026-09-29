@@ -631,10 +631,10 @@ already a string. The two `INTERVAL` types were left alone by that change too an
 Oracle is the one engine of the four whose driver hands over a NAME rather than a wire code:
 `result.metaData[].dbTypeName`. It is passed through into `QueryResult.columnTypes` verbatim
 ([column-types.ts](../../src/lib/db/providers/sql/column-types.ts)), keyed by the column name in
-`fields`, by both `query()` and `queryInTransaction()`, and it is uppercase - the same spelling
-`ALL_TAB_COLUMNS.DATA_TYPE` uses. That makes it the schema tree's `baseType`, not its `type`: the
-object surface reports a column's full declaration, such as `VARCHAR2(20 BYTE)`, and `DATA_TYPE`
-beside it ([§7](#a-columns-type-is-its-declaration-built-from-the-dictionary-1139)).
+`fields`, by both `query()` and `queryInTransaction()`, and it is uppercase.
+It is not the schema tree's `type`, which is a column's full declaration, such as `VARCHAR2(20 BYTE)` ([§7](#a-columns-type-is-its-declaration-built-from-the-dictionary-1139)).
+For most types it is the `ALL_TAB_COLUMNS.DATA_TYPE` spelling, which the tree reports as `baseType ?? type`.
+The exceptions, measured on 21c XE, are `FLOAT`, which reads `NUMBER` here, and the `TIMESTAMP` and `INTERVAL` types, which lose the precision `DATA_TYPE` carries: a `TIMESTAMP(3)` column reads `TIMESTAMP` here and `TIMESTAMP(3)` in the tree.
 
 Measured on Oracle AI Database 26ai Free over the probe table, verbatim from `oracledb`:
 
