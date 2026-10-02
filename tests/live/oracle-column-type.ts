@@ -244,6 +244,7 @@ async function probeVectors(conn: oracledb.Connection, provider: OracleProvider,
   const table = `LIBREDB_VECTOR_PROBE_${process.pid}`;
   console.log(`\n=== the VECTOR case, on ${table} ===`);
   try {
+    // Create table with 5 test vector columns
     await conn.execute(`CREATE TABLE "${table}" (${VECTOR_COLUMNS.join(", ")})`);
     const original = await shape(conn, table, VECTOR_SHAPE_SQL);
     for (const row of original) console.log(`${String(row.COLUMN_NAME)}: VECTOR_INFO=${String(row.VECTOR_INFO)}`);

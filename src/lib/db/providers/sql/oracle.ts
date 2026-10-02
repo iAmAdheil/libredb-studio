@@ -1998,10 +1998,12 @@ export class OracleProvider extends SQLBaseProvider {
   ): Promise<Record<string, unknown>[]> {
     if (this.vectorInfo) {
       try {
-        const result = await conn.execute(statement(true), binds, { outFormat: oracledb.OUT_FORMAT_OBJECT });
-        return (result.rows ?? []) as Record<string, unknown>[];
+        return ((await this.runObjectQuery(conn, statement(true), binds)).rows ?? []) as Record<string, unknown>[];
       } catch (error) {
-        if (!isMissingVectorInfoError(error)) throw mapDatabaseError(error, "oracle", statement(true));
+        // `runObjectQuery()` has already mapped the error, and the mapped error keeps Oracle's text.
+        if (!isMissingVectorInfoError(error)) throw error;
+        // Set 'vectorInfo' false only when actual isMissingVectorInfoError is thrown, else throw
+        // To be handled by the caller
         this.vectorInfo = false;
       }
     }

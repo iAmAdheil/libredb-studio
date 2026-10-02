@@ -4825,17 +4825,25 @@ describe("Oracle column reads without VECTOR_INFO (#1209)", () => {
     await provider.disconnect();
   });
 
-  test("a refusal that is not an Error is raised, with no retry", async () => {
+  test("describeObjects() raises an ORA-00904 that does not name VECTOR_INFO, with no retry", async () => {
+    // The same rule through the bulk read, which names its columns through the `c` alias.
+    // The statement WITHOUT VECTOR_INFO answers here too, which is the control.
     const asked: string[] = [];
     mockExecuteFn = async (sql: string) => {
       asked.push(sql);
-      if (sql.includes("ALL_TAB_COLUMNS")) throw "ORA-00904: VECTOR_INFO";
+      if (sql.includes("c.VECTOR_INFO")) {
+        throw Object.assign(new Error('ORA-00904: "C"."CHAR_USED": invalid identifier'), { errorNum: 904 });
+      }
+      if (sql.includes("SELECT d.NAME FROM described d")) return { rows: [{ NAME: "COLUMN_TYPES" }] };
+      if (sql.includes("ALL_TAB_COLUMNS")) {
+        return { rows: [{ OBJECT_NAME: "COLUMN_TYPES", COLUMN_NAME: "C_UROWID", ...URowId100 }] };
+      }
       return { rows: [] };
     };
     const provider = new OracleProvider({ ...baseConfig, user: "app" });
     await provider.connect();
 
-    await expect(provider.describeObject(["APP", "COLUMN_TYPES"], "table")).rejects.toBeDefined();
+    await expect(provider.describeObjects(["APP"], "table")).rejects.toThrow(/"C"."CHAR_USED": invalid identifier/);
     expect(asked.filter((sql) => sql.includes("ALL_TAB_COLUMNS"))).toHaveLength(1);
     await provider.disconnect();
   });
